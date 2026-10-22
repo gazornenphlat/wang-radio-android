@@ -2,6 +2,18 @@
 
 Plays your HomeRadio station on your phone and in Android Auto. It shows album artwork, and star ratings are saved on the station PC and copied to Plex.
 
+## Screenshots
+
+<p align="center">
+  <img src="docs/screenshots/player.png" alt="Web player: artwork, now playing, transport controls, star rating, running order" width="380">
+  <img src="docs/screenshots/stations.png" alt="Station picker" width="380">
+</p>
+<p align="center"><i>The web player and the station picker (sample song data).</i></p>
+
+<img src="docs/screenshots/settings.png" alt="Settings page: every radio.toml value editable in place" width="760">
+
+<p align="center"><i>The settings page edits every value in <code>radio.toml</code> in place, and keeps a backup.</i></p>
+
 ## Get the APK (no Android Studio needed)
 1. Create a free GitHub account, then make a new **private** repository named `wang-radio`.
 2. Upload everything in this folder to that repository. On the repository page, choose **Add file → Upload files** and drag the folder contents in. Include the hidden `.github` folder, because that is what builds the app.

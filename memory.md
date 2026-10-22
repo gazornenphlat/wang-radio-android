@@ -81,6 +81,11 @@ CLAUDE.md holds the rules; this file holds the history. Add to the log as things
   (55 files, same MD5s, nothing unique), verified before deleting; recoverable from commit `e57381d`.
 - The random logo picker and ID picker re-read their folders, so renames take effect on the next pick; a
   station restart is the clean way to be sure.
+- README screenshots added under `docs/screenshots/` (player, station picker, settings). They were rendered
+  with headless Chrome at 2x from `radio.py`'s own PAGE/PICKER/SETTINGS templates served by a throwaway mock
+  (temp only, never committed) fed sample song data, then trimmed and downscaled with Pillow. The `[notify]`
+  topic was blanked in the mock first so no private values appear in the images. The station itself was not
+  started, so no audio was played.
 
 ## Open items / to verify
 - Confirm the Android 2.0 build passes in GitHub Actions after the `wang_red` fix (nothing else
