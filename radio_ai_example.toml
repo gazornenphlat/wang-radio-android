@@ -1,0 +1,93 @@
+# ---- Add these sections to radio.toml ------------------------------------
+
+[ai]
+enabled = true            # false = templates only, exactly like today
+facts = true              # look up verified artist facts on Wikipedia
+timeout_seconds = 25
+
+# Which model does which job: "provider:model". Ollama by default.
+[ai.models]
+talk     = "ollama:llama3.1:8b"
+facts    = "ollama:llama3.1:8b"
+phone_in = "ollama:llama3.1:8b"
+# talk = "claude:claude-sonnet-5"      # example: hosted model for on-air talk only
+
+[ai.providers.ollama]
+type = "ollama"
+url  = "http://localhost:11434"
+
+# Optional hosted APIs. Unused unless a model above names them.
+# Put keys in environment variables rather than this file.
+[ai.providers.claude]
+type = "anthropic"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[ai.providers.openai]
+type = "openai"                        # any OpenAI-compatible server
+url  = "https://api.openai.com/v1"     # or Groq, OpenRouter, LM Studio, vLLM...
+api_key_env = "OPENAI_API_KEY"
+
+# ---- Voices --------------------------------------------------------------
+# Kokoro and Chatterbox run as small local servers with an
+# OpenAI-style /v1/audio/speech endpoint (e.g. Kokoro-FastAPI,
+# chatterbox-tts-api). If a voice fails, espeak-ng is used instead.
+[ai.voices.kokoro]
+url   = "http://localhost:8880"
+model = "kokoro"
+
+[ai.voices.chatterbox]
+url   = "http://localhost:4123"
+model = "chatterbox"
+extra = { exaggeration = 0.5 }         # passed straight to the server
+
+[ai.voices.piper]
+binary = "piper"
+
+# ---- Personas (one per channel) --------------------------------------------
+[ai.personas.default]
+name = "Tito"
+style = "Morning zoo radio, wacky, silly, puns."
+talkativeness = 0.7                    # 0 = says almost nothing, 1 = chatty
+voice = { engine = "kokoro", voice = "bm_atten_inno" }
+# voice = { engine = "chatterbox", voice = "dana_sample" }
+# voice = { engine = "piper", model = "/home/YOURUSER/piper/en_US-amy-medium.onnx" }
+caller_voices = [
+  { engine = "kokoro", voice = "am_adam" },
+  { engine = "kokoro", voice = "bf_emma" },
+  { engine = "kokoro", voice = "am_michael" },
+]
+
+[ai.personas.rock]
+name = "Mick"
+style = "High energy, punchy, short sentences, classic-rock DJ swagger."
+talkativeness = 0.6
+voice = { engine = "kokoro", voice = "bm_george" }
+
+# In each [[channels]] entry, add:   persona = "rock"
+# Channels without one use "default".
+
+# ---- Fake phone-in calls -------------------------------------------------
+[ai.phone_in]
+enabled = true
+per_day = 12                    # how many calls a day
+between_hours = [10, 21]       # only between 10:00 and 21:00
+min_gap_hours = 1              # at least this long between calls
+max_turns = 12
+
+# ---- Ratings and rotation ------------------------------------------------
+# 1-star songs are never played again (no setting; always on).
+[ratings]
+file = "ratings.json"
+# How often a song you rated comes up (1.0 = normal)
+rating_weight = { "2" = 0.4, "3" = 1.0, "4" = 1.2, "5" = 1.4 }
+# Extra chance for songs Plex says are SIMILAR to a song you rated.
+# 0.25 = 25% more often, 1.5 = 2.5x as often.
+similar_boost = { "3" = 0.25, "4" = 0.6, "5" = 1.5 }
+same_artist_share = 0.5        # same artist gets half the boost
+
+# ---- Pronunciations (applied before any voice speaks) ------------------
+[pronunciations]
+"Sade" = "Shah-day"
+"AC/DC" = "A C D C"
+"Hozier" = "Hoe-zeer"
+"Mötley Crüe" = "Motley Crew"

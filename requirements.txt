@@ -1,0 +1,12 @@
+# WANG Radio / HomeRadio - Python packages
+# Install with:  pip install -r requirements.txt
+#
+# Needs Python 3.11 or newer. The station itself uses only Python's built-in
+# libraries; these two are for the Windows system tray icon (optional).
+pystray>=0.19
+pillow>=10.0
+#
+# Also needed, but installed separately (not pip packages):
+#   ffmpeg / ffprobe   winget install ffmpeg            (required)
+#   Piper voices       https://github.com/rhasspy/piper (optional; or use the Windows voice)
+#   cloudflared        winget install Cloudflare.cloudflared   (optional; public link)
