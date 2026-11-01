@@ -28,6 +28,7 @@
     <string name="on_air">● On air</string>
     <string name="buffering">Tuning in…</string>
     <string name="offline">Can\'t reach the station</string>
+    <string name="zero_time">0:00</string>
     <string name="your_rating">Your rating</string>
     <string name="star_1">1 star — never play again</string>
     <string name="star_2">2 stars</string>

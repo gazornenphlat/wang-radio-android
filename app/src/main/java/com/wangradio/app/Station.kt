@@ -54,7 +54,8 @@ data class Channel(
     val listeners: Int,
 )
 
-data class TrackRef(val id: String, val title: String, val artist: String, val artUrl: String?)
+data class TrackRef(val id: String, val title: String, val artist: String, val artUrl: String?,
+                    val duration: Int = 0)
 
 data class NowPlaying(
     val id: String?,          // null during station breaks (IDs, time, news, weather)
@@ -67,6 +68,8 @@ data class NowPlaying(
     val station: String,
     val previous: TrackRef?,
     val next: TrackRef?,
+    val duration: Int = 0,    // song length in seconds (0 during breaks)
+    val elapsed: Int = 0,     // seconds played so far when the station answered
 )
 
 /** One line of radio.toml, as the station's /settings.json describes it. */
@@ -142,6 +145,8 @@ class StationApi(private val ctx: Context) {
                 station = j.optString("station", "WANG Radio"),
                 previous = ref(j.optJSONObject("previous")),
                 next = ref(j.optJSONObject("next")),
+                duration = t.optInt("duration", 0),
+                elapsed = t.optInt("elapsed", 0),
             )
         }.getOrNull()
     }
@@ -152,6 +157,7 @@ class StationApi(private val ctx: Context) {
             title = it.optString("title"),
             artist = it.optString("artist"),
             artUrl = it.optString("art").takeIf { a -> a.isNotEmpty() }?.let { a -> base + a },
+            duration = it.optInt("duration", 0),
         )
     }
 

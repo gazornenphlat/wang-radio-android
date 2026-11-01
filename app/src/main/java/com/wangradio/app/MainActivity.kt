@@ -89,6 +89,13 @@ class MainActivity : AppCompatActivity() {
         handleIntent(intent)
         if (!Prefs.isConfigured(this)) showSettings()
 
+        // play time: counts up every second between station updates
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                while (true) { paintProgress(); delay(1000) }
+            }
+        }
+
         // While the screen is visible, keep the song info / thumbs fresh even when not playing.
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
@@ -221,10 +228,30 @@ class MainActivity : AppCompatActivity() {
         starButtons.forEach { it.isEnabled = np.id != null; it.alpha = if (np.id != null) 1f else 0.4f }
         showRow(b.prevRow, np.previous)
         showRow(b.nextRow, np.next)
+        songLength = np.duration; songElapsed = np.elapsed; heardAt = System.currentTimeMillis()
+        paintProgress()
         loadArt(np.artUrl)
     }
 
     /** Filled cells turn orange with a charcoal star; empty cells stay white with a grey star. */
+    private var songLength = 0
+    private var songElapsed = 0
+    private var heardAt = 0L
+
+    private fun fmt(s: Int) = "%d:%02d".format(s / 60, s % 60)
+
+    private fun paintProgress() {
+        if (songLength <= 0) { b.progressBox.visibility = android.view.View.GONE; return }
+        b.progressBox.visibility = android.view.View.VISIBLE
+        val el = minOf(songLength, songElapsed + ((System.currentTimeMillis() - heardAt) / 1000).toInt())
+        b.timeElapsed.text = fmt(el)
+        b.timeLength.text = fmt(songLength)
+        val inner = b.progressTrack.width - b.progressTrack.paddingLeft - b.progressTrack.paddingRight
+        val lp = b.progressFill.layoutParams
+        lp.width = if (inner > 0) inner * el / songLength else 0
+        b.progressFill.layoutParams = lp
+    }
+
     private fun paintStars(n: Int) {
         stars = n
         val on = ColorStateList.valueOf(getColor(R.color.on_primary))
@@ -283,7 +310,8 @@ class MainActivity : AppCompatActivity() {
         }
         row.root.visibility = android.view.View.VISIBLE
         row.rowTitle.text = t.title
-        row.rowArtist.text = t.artist
+        row.rowArtist.text = listOf(t.artist, if (t.duration > 0) fmt(t.duration) else "")
+            .filter { it.isNotEmpty() }.joinToString(" · ")
         loadInto(row.rowArt, t.artUrl)
     }
 

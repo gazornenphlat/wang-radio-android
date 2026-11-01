@@ -144,6 +144,41 @@
                 app:layout_constraintStart_toStartOf="parent"
                 app:layout_constraintTop_toBottomOf="@id/title" />
 
+            <!-- play time: progress bar + elapsed / length -->
+            <LinearLayout
+                android:id="@+id/progress_box"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="20dp"
+                android:orientation="vertical"
+                android:visibility="gone"
+                app:layout_constraintEnd_toEndOf="parent"
+                app:layout_constraintStart_toStartOf="parent"
+                app:layout_constraintTop_toBottomOf="@id/artist">
+                <FrameLayout
+                    android:id="@+id/progress_track"
+                    android:layout_width="match_parent"
+                    android:layout_height="24dp"
+                    android:background="@drawable/field"
+                    android:padding="3dp">
+                    <View
+                        android:id="@+id/progress_fill"
+                        android:layout_width="0dp"
+                        android:layout_height="match_parent"
+                        android:background="@color/primary" />
+                </FrameLayout>
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:orientation="horizontal">
+                    <TextView android:id="@+id/time_elapsed" style="@style/Kicker" android:layout_width="0dp"
+                        android:layout_height="wrap_content" android:layout_weight="1" android:text="@string/zero_time" />
+                    <TextView android:id="@+id/time_length" style="@style/Kicker" android:layout_width="wrap_content"
+                        android:layout_height="wrap_content" android:text="@string/zero_time" />
+                </LinearLayout>
+            </LinearLayout>
+
             <!-- transport: previous | big orange play | next -->
             <LinearLayout
                 android:id="@+id/transport"
@@ -153,7 +188,7 @@
                 android:orientation="horizontal"
                 app:layout_constraintEnd_toEndOf="parent"
                 app:layout_constraintStart_toStartOf="parent"
-                app:layout_constraintTop_toBottomOf="@id/artist">
+                app:layout_constraintTop_toBottomOf="@id/progress_box">
 
                 <ImageButton
                     android:id="@+id/prev_button"
