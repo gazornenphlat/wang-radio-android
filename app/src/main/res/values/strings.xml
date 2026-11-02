@@ -48,6 +48,7 @@
     <string name="rating_failed">Couldn\'t save rating %1$s</string>
     <string name="rating_failed_generic">Couldn\'t save rating</string>
     <string name="skip_failed">Couldn\'t reach the station</string>
+    <string name="skip_not_allowed">Skipping is off for this station</string>
     <string name="stars_saved">%1$s saved</string>
     <string name="stars_cleared">Rating cleared</string>
     <string name="one_star_skip">1 star — never again. Skipping</string>

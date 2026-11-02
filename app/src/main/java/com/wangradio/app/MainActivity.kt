@@ -63,6 +63,7 @@ class MainActivity : AppCompatActivity() {
     private var rating: String? = null
     private var stars = 0
     private var currentId: String? = null
+    private var allowSkip = true                  // false: channel has skipping turned off
     private val starButtons by lazy { listOf(b.star1, b.star2, b.star3, b.star4, b.star5) }
     private var switchTo: String? = null          // station picked on the main screen, to start playing
     private var chatJob: Job? = null
@@ -247,6 +248,11 @@ class MainActivity : AppCompatActivity() {
         starButtons.forEach { it.isEnabled = np.id != null; it.alpha = if (np.id != null) 1f else 0.4f }
         showRow(b.prevRow, np.previous)
         showRow(b.nextRow, np.next)
+        allowSkip = np.allowSkip
+        val skipVis = if (allowSkip) android.view.View.VISIBLE else android.view.View.GONE
+        b.nextButton.visibility = skipVis
+        b.prevButton.visibility = skipVis
+        b.nextRow.rowAction.visibility = skipVis
         songLength = np.duration; songElapsed = np.elapsed; heardAt = System.currentTimeMillis()
         paintProgress()
         loadArt(np.artUrl)
@@ -309,6 +315,7 @@ class MainActivity : AppCompatActivity() {
 
     /** Swap the up-next song before it plays. */
     private fun skipUpNext() {
+        if (!allowSkip) return
         b.nextRow.rowAction.isEnabled = false
         lifecycleScope.launch {
             val t = api.skipUpNext()
@@ -353,6 +360,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun skip(direction: String) {
+        if (!allowSkip) return
         val c = controller
         if (c != null) {
             c.sendCustomCommand(
