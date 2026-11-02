@@ -32,3 +32,52 @@ build/
 local.properties
 *.iml
 .idea/
+
+# ---- station (server) ----
+# ---- Secrets and personal config: never commit ----
+radio.toml
+radio.toml.bak
+*.env
+.env
+
+# ---- Per-station state written at runtime ----
+ratings.json
+facts.json
+notebook_*.json
+vibes.jsonl
+chat_log.csv
+social_feed.jsonl
+notes.json
+effects_cache/
+*.log
+radio.log
+
+# ---- Python ----
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# ---- Test output ----
+test_run_*/
+tmp_station_*/
+
+# ---- Android (no Gradle wrapper in this repo; GitHub Actions builds the APK) ----
+.gradle/
+build/
+app/build/
+local.properties
+*.apk
+*.aab
+*.keystore
+*.jks
+.idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+
+# ---- OS / editor ----
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/

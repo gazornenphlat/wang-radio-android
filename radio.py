@@ -45,12 +45,15 @@ def probe(path):
         name = os.path.splitext(os.path.basename(path))[0]
         title = tags.get("title", name)
         artist = tags.get("artist")
+        year = re.sub(r"\D", "", str(tags.get("date") or tags.get("year") or ""))[:4]
         info = {"id": track_id(path), "title": title, "artist": artist or "",
-                "album": tags.get("album", ""), "file": os.path.basename(path)}
+                "album": tags.get("album", ""), "file": os.path.basename(path),
+                "genre": tags.get("genre", ""), "year": year}
         return float(fmt.get("duration", 0) or 0), (f"{artist} - {title}" if artist else title), info
     except Exception:
         name = os.path.basename(path)
-        return 0.0, name, {"id": track_id(path), "title": name, "artist": "", "album": "", "file": name}
+        return 0.0, name, {"id": track_id(path), "title": name, "artist": "", "album": "",
+                           "file": name, "genre": "", "year": ""}
 
 
 COVER_NAMES = ("cover", "folder", "front", "album", "albumart", "albumartsmall", "artwork")
@@ -235,6 +238,18 @@ class Plex:
                 log.warning("Plex not reachable (%s): %s", self.url, e)
 
 
+def _answers(url, path="", timeout=2.0):
+    """(up, detail): any HTTP answer, even 401, counts as up. No answer at all is down."""
+    try:
+        req = urllib.request.Request(url.rstrip("/") + path, headers={"User-Agent": "HomeRadio/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return True, f"answered ({r.status})"
+    except urllib.error.HTTPError as e:
+        return True, f"answered ({e.code})"
+    except Exception as e:
+        return False, str(e)[:120]
+
+
 def http_get(url, timeout=10):
     req = urllib.request.Request(url, headers={"User-Agent": "HomeRadio/1.0"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -258,13 +273,15 @@ class Library:
     and the folders are (re)scanned in the background. On the very first run, playback
     starts as soon as the first few songs are found while the scan keeps going."""
 
-    def __init__(self, folders, rescan_minutes=30, cache_path=None):
+    def __init__(self, folders, rescan_minutes=30, cache_path=None, track_filter=None):
         if isinstance(folders, str):
             folders = [folders]
         self.folders = [os.path.expanduser(f) for f in folders if f]
         self.folder = ", ".join(self.folders)          # for log messages
         self.rescan_every = max(1, rescan_minutes) * 60
         self.cache_path = cache_path
+        self.track_filter = track_filter               # callable(path, info) -> bool, or None
+        self._warned_empty = False
         self.lock = threading.Lock()
         self.ready = threading.Event()
         self.files = []
@@ -349,11 +366,29 @@ class Library:
         self.ready.wait()
         with self.lock:
             files = self.files
+        if self.track_filter:
+            kept = [f for f in files if self._passes_filter(f)]
+            if kept:
+                self._warned_empty = False
+            elif files and not self._warned_empty:
+                # Keep the station on the air rather than going silent; say why.
+                log.warning("Channel filter matches no songs yet (%s); playing unfiltered for now",
+                            self.folder)
+                self._warned_empty = True
+            files = kept or files
         size = max(1, len(files) * 2 // 3)
         if self.recent.maxlen != size:                 # don't repeat until ~2/3 of the library has played
             self.recent = collections.deque(self.recent, maxlen=size)
         recent = set(self.recent)
         return [f for f in files if f not in recent] or files
+
+    def _passes_filter(self, path):
+        """Check a track against the channel's genre/artist/star filter."""
+        try:
+            _, _, info = self.duration(path)
+            return self.track_filter(path, info)
+        except Exception:
+            return True
 
     def next(self, max_seconds=None, ratings=None, banned=None, ai=None):
         """Pick a track; if max_seconds is given, try to find one that fits.
@@ -531,7 +566,9 @@ class TTS:
         subprocess.run(["powershell", "-NoProfile", "-Command", ps], input=text.encode("utf-8"),
                        capture_output=True, timeout=60, check=True)
 
-    _lock = threading.Lock()           # one voice at a time: parallel Windows speech can hang
+    # one voice at a time: parallel Windows speech can hang (shared with homeradio_ai's voices)
+    _lock = homeradio_ai.WINDOWS_SPEECH_LOCK if homeradio_ai and hasattr(homeradio_ai, "WINDOWS_SPEECH_LOCK") \
+        else threading.Lock()
 
     def render(self, text):
         with TTS._lock:
@@ -568,6 +605,25 @@ class TTS:
 
 
 # ---------------------------------------------------------------- streaming
+def voice_filter(path, target_lufs):
+    """A filter that brings a speech clip to target_lufs. Measures the clip first (one-pass
+    loudnorm can't judge a few seconds of speech, which left voices far quieter than the music),
+    then applies the gain linearly with a true-peak ceiling."""
+    fallback = f"loudnorm=I={target_lufs}:TP=-1.5:LRA=11"
+    try:
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", path, "-af",
+                            f"loudnorm=I={target_lufs}:TP=-1.5:LRA=11:print_format=json", "-f", "null", "-"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+        m = json.loads(r.stderr[r.stderr.rindex("{"):r.stderr.rindex("}") + 1])
+        if float(m["input_i"]) < -70:                 # silence: nothing to measure
+            return fallback
+        return (f"loudnorm=I={target_lufs}:TP=-1.5:LRA=11:measured_I={m['input_i']}:"
+                f"measured_TP={m['input_tp']}:measured_LRA={m['input_lra']}:"
+                f"measured_thresh={m['input_thresh']}:offset={m['target_offset']}:linear=true")
+    except Exception:
+        return fallback
+
+
 class Broadcaster:
     """Fans encoded MP3 out to all connected listeners."""
     def __init__(self, burst_seconds=4, kbps=128):
@@ -576,6 +632,14 @@ class Broadcaster:
         self.burst_bytes, self.burst_max = 0, burst_seconds * kbps * 125
         self.title = "Starting up"
         self.track = {"id": None, "title": "Starting up", "artist": "", "album": "", "kind": "station"}
+        self.empty_since = time.monotonic() - 86400   # when the last listener left (None = someone's on)
+        self.joined = threading.Event()            # set whenever a listener connects
+
+    def clear_burst(self):
+        """Forget the saved head start, so a player that reconnects (after Next) starts at live."""
+        with self.lock:
+            self.burst.clear()
+            self.burst_bytes = 0
 
     def publish(self, chunk):
         with self.lock:
@@ -595,11 +659,24 @@ class Broadcaster:
             if self.burst:
                 q.put_nowait(b"".join(self.burst))
             self.listeners.add(q)
+            self.empty_since = None
+        self.joined.set()
         return q
 
     def remove(self, q):
         with self.lock:
             self.listeners.discard(q)
+            if not self.listeners and self.empty_since is None:
+                self.empty_since = time.monotonic()
+
+    def idle_for(self):
+        """Seconds since the last listener left (0 while someone is listening)."""
+        with self.lock:
+            if self.listeners:
+                return 0.0
+            if self.empty_since is None:
+                self.empty_since = time.monotonic()
+            return time.monotonic() - self.empty_since
 
 
 class Encoder:
@@ -812,6 +889,11 @@ def make_handler(hub):
         def _authed(self, qs):
             return not password or qs.get("key", [""])[0] == password
 
+        def client_ip(self):
+            return (self.headers.get("Cf-Connecting-Ip")
+                    or self.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+                    or self.client_address[0])
+
         def _route(self, path):
             """'/c/<station>/rest' -> (station, '/rest');  old-style '/rest' -> (first station, '/rest')."""
             if path.startswith("/c/"):
@@ -830,6 +912,11 @@ def make_handler(hub):
             if u.path == "/":                                   # main screen: pick a station
                 page = PICKER.replace("%TITLE%", html.escape(hub.title)).replace("%KEY%", key)
                 return self.send(200, "text/html; charset=utf-8", page.replace("%STYLE%", STYLE_HEAD).encode())
+            if u.path == "/health":
+                return self.send(200, "text/html; charset=utf-8",
+                                 health_page(hub, key).replace("%STYLE%", STYLE_HEAD).encode())
+            if u.path == "/health.json":
+                return self.send(200, "application/json", json.dumps({"checks": hub.health()}).encode())
             if u.path == "/settings":
                 page = SETTINGS.replace("%TITLE%", html.escape(hub.title)).replace("%KEY%", key)
                 return self.send(200, "text/html; charset=utf-8", page.replace("%STYLE%", STYLE_HEAD).encode())
@@ -862,8 +949,14 @@ def make_handler(hub):
                 return self.stream(ctx, no_icy="noicy" in qs)
             if path == "/status.json":
                 t = dict(bc.track)
+                allow_skip = ctx.allow_skip
                 t.pop("path", None)
                 art_id = t.pop("art_id", None) or t.get("id") or "station"
+                with ctx.state_lock:
+                    cur, end = ctx.current_song, ctx.current_end
+                if t.get("id") and cur:
+                    t["duration"] = round(ctx.lib.duration(cur)[0])
+                    t["elapsed"] = round(max(0.0, min(t["duration"], t["duration"] - (end - time.time()))))
                 body = json.dumps({"station": station, "station_id": ctx.id, "now_playing": bc.title,
                                    "listeners": len(bc.listeners), "track": t,
                                    "rating": hub.ratings.get(t["id"]) if t.get("id") else None,
@@ -871,6 +964,7 @@ def make_handler(hub):
                                    "art": f"{ctx.base}/art?id={art_id}" + (f"&key={urllib.parse.quote(password)}" if password else ""),
                                    "previous": ctx.public(ctx.previous_path()),
                                    "next": ctx.public(ctx.next_path()),
+                                   "allow_skip": allow_skip,
                                    }, ensure_ascii=False).encode()
                 return self.send(200, "application/json; charset=utf-8", body)
             if path == "/art":
@@ -883,6 +977,31 @@ def make_handler(hub):
                 self.send_header("Cache-Control", "public, max-age=86400")
                 self.end_headers()
                 return self.wfile.write(data)
+            if path == "/chat.json":
+                chat = hub.ai.chat if hub.ai else None
+                if not chat:
+                    return self.send(200, "application/json; charset=utf-8",
+                                     json.dumps({"off": True, "messages": []}).encode())
+                try:
+                    since = int(qs.get("since", ["0"])[0])
+                except ValueError:
+                    since = 0
+                body = {"messages": chat.messages(ctx.id, since), "status": chat.status(),
+                        "owner": settings_allowed(self, admin_password)}
+                return self.send(200, "application/json; charset=utf-8",
+                                 json.dumps(body, ensure_ascii=False).encode())
+            if path == "/notes.json":
+                out = {"now": None, "next": None}
+                if hub.ai:
+                    with ctx.state_lock:
+                        cur = ctx.current_song
+                    if cur:
+                        out["now"] = hub.ai.notes_for(ctx.info_for(cur))
+                    nxt = ctx.next_path()
+                    if nxt:
+                        out["next"] = hub.ai.notes_for(ctx.info_for(nxt))
+                return self.send(200, "application/json; charset=utf-8",
+                                 json.dumps(out, ensure_ascii=False).encode())
             if path == "/ratings.json":
                 body = json.dumps(hub.ratings.data, indent=1, ensure_ascii=False).encode()
                 return self.send(200, "application/json; charset=utf-8", body)
@@ -916,14 +1035,50 @@ def make_handler(hub):
                              len(changes), "" if len(changes) == 1 else "s")
                 return self.send(400 if err else 200, "application/json",
                                  json.dumps({"ok": not err, "error": err}).encode())
+            if u.path == "/restart":
+                if not settings_allowed(self, admin_password):
+                    return self.send(403, "application/json", json.dumps(
+                        {"ok": False, "error": "Only the station owner can restart"}).encode())
+                self.send(200, "application/json", json.dumps({"ok": True}).encode())
+                t = threading.Timer(1.0, restart_station)   # let the reply go out first
+                t.daemon = True
+                t.start()
+                return
             ctx, path, _ = self._route(u.path)
             if not ctx:
                 return self.send_error(404, "No such station")
             bc = ctx.bc
+            if path in ("/chat", "/chat/approve"):
+                chat = hub.ai.chat if hub.ai else None
+                if not chat:
+                    return self.send(503, "application/json", json.dumps(
+                        {"ok": False, "error": "Chat is off"}).encode())
+                try:
+                    n = int(self.headers.get("Content-Length", 0) or 0)
+                    req = json.loads(self.rfile.read(n) or b"{}") if n else {}
+                except ValueError:
+                    req = {}
+                if path == "/chat/approve":
+                    if not settings_allowed(self, admin_password):
+                        return self.send(403, "application/json", json.dumps(
+                            {"ok": False, "error": "Only the station owner can do that"}).encode())
+                    ok = chat.approve(ctx.id, req.get("id"), bool(req.get("ok", True)))
+                    return self.send(200, "application/json", json.dumps({"ok": ok}).encode())
+                res = chat.submit(ctx.id, req.get("name", ""), req.get("text", ""), self.client_ip())
+                return self.send(200 if res.get("ok") else 429 if "try again" in str(res.get("error", ""))
+                                 else 400, "application/json",
+                                 json.dumps(res, ensure_ascii=False).encode())
             if path == "/skip":
                 direction = qs.get("dir", ["next"])[0]
+                if not ctx.allow_skip:
+                    return self.send(403, "application/json", json.dumps(
+                        {"ok": False, "error": "Skipping is off for this channel"}).encode())
+                if direction == "upnext":
+                    new = ctx.skip_upnext()
+                    return self.send(200 if new else 409, "application/json",
+                                     json.dumps({"ok": bool(new), "next": ctx.public(new)}).encode())
                 if direction not in ("next", "back"):
-                    return self.send_error(400, "dir must be next or back")
+                    return self.send_error(400, "dir must be next, back or upnext")
                 ok = ctx.command(direction)
                 return self.send(200 if ok else 409, "application/json", json.dumps({"ok": ok}).encode())
             if path != "/rate":
@@ -1093,6 +1248,11 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 .title{font:400 32px/1.05 var(--serif);letter-spacing:-.02em;margin:10px 0 0;overflow:hidden;display:-webkit-box;
  -webkit-line-clamp:3;-webkit-box-orient:vertical}
 .artist{margin:12px 0 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.prog{height:24px;border:3px solid var(--border);background:var(--surface);position:relative;margin-top:20px}
+.prog .fill{position:absolute;top:0;left:0;height:100%;background:var(--primary);border-right:3px solid var(--border);
+ min-width:0;transition:width .9s linear}
+.prog .fill[style*="width: 0"]{border-right:0}
+.time{display:flex;justify-content:space-between;margin-top:8px}
 .controls{display:grid;grid-template-columns:64px 1fr 64px;gap:16px;align-items:stretch;margin-top:32px}
 .controls .ib{width:64px;height:auto;min-height:64px}
 #play{border:3px solid var(--border);background:var(--primary);color:var(--on-primary);box-shadow:8px 8px 0 0 var(--border);
@@ -1113,13 +1273,40 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 .q{display:flex;gap:16px;align-items:center;padding:16px 20px;border-top:3px solid var(--border);position:relative}
 .q[hidden]{display:none}
 .q img{width:52px;height:52px;object-fit:cover;border:3px solid var(--border);background:var(--surface);flex:none}
-.q div{min-width:0}
+.q div{min-width:0}.q .btn2{flex:none;padding:10px 12px}
 .q b{display:block;font:400 20px/1.2 var(--serif);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:6px}
 .q span{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:4px;color:var(--muted)}
 .q.past{background:var(--surface);color:var(--muted)}
 .q.past b{text-decoration:line-through;text-decoration-thickness:2px}
 .q.past img{filter:grayscale(1)}
 .foot{display:flex;flex-wrap:wrap;gap:16px;align-items:center;justify-content:space-between;margin-top:40px}
+.panel{margin-top:40px}
+.ph{background:var(--border);color:#fff;padding:12px 20px;display:flex;justify-content:space-between;align-items:center;gap:12px}
+.ph i{font:italic 400 14px var(--serif)}
+.pb{padding:20px;border-top:3px solid var(--border)}
+.note b{display:block;font:400 20px/1.25 var(--serif);margin-top:6px}
+.note p{margin:10px 0 0}
+.note .src{margin-top:12px}
+.note .src a{color:var(--ink)}
+.msgs{max-height:340px;overflow-y:auto}
+.msg{padding:14px 20px;border-top:3px solid var(--border);position:relative}
+.msg:first-child{border-top:0}
+.msg .who{display:flex;justify-content:space-between;gap:12px;align-items:baseline}
+.msg p{margin:8px 0 0;word-wrap:break-word;overflow-wrap:anywhere}
+.msg.aired{background:var(--primary)}
+.msg.blocked{background:var(--surface);color:var(--muted)}
+.msg.blocked p{text-decoration:line-through;text-decoration-thickness:2px}
+.msg .tag{white-space:nowrap}
+.msg .ctl{display:flex;gap:8px;margin-top:12px}
+.msg .ctl button{padding:8px 12px}
+.say{display:flex;flex-direction:column;gap:12px;padding:20px;border-top:3px solid var(--border)}
+.say .line{display:flex;gap:12px;min-width:0;flex-wrap:wrap}
+.say input{font:400 14px/1.45 var(--sans);color:var(--ink);background:var(--card);border:3px solid var(--border);
+ padding:10px 12px;min-width:0;outline:none;border-radius:0}
+.say .hint{min-width:0}
+.say input:focus{box-shadow:4px 4px 0 0 var(--border)}
+.say #who{flex:1 1 7em}.say #what{flex:3 1 10em}
+.say .hint{color:var(--muted)}
 </style></head><body>
 <header class="bar">
  <div class="who"><a class="ib" href="/%KEY%" title="All stations" aria-label="All stations">ICON_BACK</a>
@@ -1129,7 +1316,9 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <main class="wrap">
 <section class="card hero artcard"><img class="art" id="art" alt="Album artwork"><span class="chip on" id="status" hidden></span></section>
 <section class="np"><div class="k">Now playing</div>
- <p class="title" id="title">%STATION%</p><p class="artist k" id="artist">&nbsp;</p></section>
+ <p class="title" id="title">%STATION%</p><p class="artist k" id="artist">&nbsp;</p>
+ <div id="progBox" hidden><div class="prog" role="progressbar" aria-label="Song progress"><div class="fill" id="fill"></div></div>
+ <div class="time k"><span id="elapsed">0:00</span><span id="length">0:00</span></div></div></section>
 <div class="controls">
  <button class="ib" id="back" title="Previous song" aria-label="Previous song">ICON_PREV</button>
  <button id="play" class="press" title="Play" aria-label="Play"><span><span class="k" id="playk">Tune in</span><br><span class="lbl" id="playl">Listen <i>live</i></span></span>
@@ -1140,8 +1329,27 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <section class="card queue">
  <div class="qh"><span class="k">The running order</span><i>Before &amp; after</i></div>
  <div class="q past" id="prevRow" hidden><img id="prevArt" alt=""><div><span class="k">I. Previously</span><b id="prevTitle"></b><span id="prevArtist" class="k"></span></div></div>
- <div class="q" id="nextRow" hidden><img id="nextArt" alt=""><div><span class="k">II. Up next</span><b id="nextTitle"></b><span id="nextArtist" class="k"></span></div></div>
+ <div class="q" id="nextRow" hidden><img id="nextArt" alt=""><div style="flex:1"><span class="k">II. Up next</span><b id="nextTitle"></b><span id="nextArtist" class="k"></span></div>
+  <button class="btn2" id="skipNext" title="Pick a different song to play next" aria-label="Skip the up next song">ICON_NEXT Skip</button></div>
 </section>
+<section class="card panel" id="notesPanel" hidden>
+ <div class="ph"><span class="k">From the archive</span><i>Station notes</i></div>
+ <div class="pb note" id="noteNow"></div>
+ <div class="pb note" id="noteNext"></div>
+</section>
+
+<section class="card panel" id="chatPanel" hidden>
+ <div class="ph"><span class="k">Station chat</span><i>Say hello, ask for a <b style="font-weight:400">vibe</b></i></div>
+ <div class="msgs" id="msgs"></div>
+ <form class="say" id="say">
+  <div class="line"><input id="who" placeholder="Your name" maxlength="20" autocomplete="nickname">
+   <input id="what" placeholder="Shoutout, or the mood you want&hellip;" maxlength="280" autocomplete="off"></div>
+  <div class="line" style="justify-content:space-between;align-items:center">
+   <span class="k hint" id="chatHint">Read on air by the DJ</span>
+   <button class="btn2" type="submit" id="send">Send</button></div>
+ </form>
+</section>
+
 <div class="foot"><span class="chip" id="listeners">&nbsp;</span>
  <a class="btn2" href="%BASE%/listen.m3u%KEY%">ICON_EXT Open in VLC</a></div>
 </main><div id="toast"></div>
@@ -1155,13 +1363,22 @@ const PLAY="M240 128a15.7 15.7 0 0 1-7.6 13.5L88.3 229.6a16 16 0 0 1-24.3-13.5V3
  STOP="M216 56v144a16 16 0 0 1-16 16H56a16 16 0 0 1-16-16V56a16 16 0 0 1 16-16h144a16 16 0 0 1 16 16z";
 function toast(t){const e=$("toast");e.textContent=t;e.classList.add("show");clearTimeout(e._t);e._t=setTimeout(()=>e.classList.remove("show"),2500)}
 function setImg(img,src){if(src&&img.dataset.src!==src){img.dataset.src=src;img.src=src}}
-function row(k,t){$(k+"Row").hidden=!t;if(!t)return;$(k+"Title").textContent=t.title;$(k+"Artist").textContent=t.artist||"";setImg($(k+"Art"),t.art)}
+const fmt=s=>{s=Math.max(0,Math.round(s||0));return Math.floor(s/60)+":"+String(s%60).padStart(2,"0")};
+function row(k,t){$(k+"Row").hidden=!t;if(!t)return;$(k+"Title").textContent=t.title;
+ $(k+"Artist").textContent=[t.artist,t.duration?fmt(t.duration):""].filter(Boolean).join(" \\u00b7 ");setImg($(k+"Art"),t.art)}
+let pos=null;   // {dur, el, at}: song length, elapsed, when we heard it
+function paintProg(){if(!pos){$("progBox").hidden=true;return}$("progBox").hidden=false;
+ const el=Math.min(pos.dur,pos.el+(Date.now()-pos.at)/1000);$("fill").style.width=(100*el/pos.dur).toFixed(2)+"%";
+ $("elapsed").textContent=fmt(el);$("length").textContent=fmt(pos.dur)}
+setInterval(paintProg,1000);
 function status(t){const s=$("status");s.hidden=!t;s.textContent=t||""}
 async function refresh(){
  try{const j=await (await fetch(U("/status.json"),{cache:"no-store"})).json();cur=j;
+  document.querySelectorAll("#next,#back,#skipNext").forEach(e=>e.hidden=j.allow_skip===false);
   const t=j.track||{};$("title").textContent=t.title||j.now_playing;
   $("artist").textContent=[t.artist,t.album].filter(Boolean).join(" \\u00b7 ")||"\\u00a0";
   setImg($("art"),j.art);row("prev",j.previous);row("next",j.next);
+  pos=t.duration?{dur:t.duration,el:t.elapsed||0,at:Date.now()}:null;paintProg();
   [...$("stars").children].forEach(b=>b.disabled=!t.id);paintStars(j.stars||0);
   $("listeners").textContent=j.listeners+" listening";
   if(!playing&&$("status").textContent==="Can't reach the station")status("");
@@ -1177,8 +1394,12 @@ audio.addEventListener("waiting",()=>{if(playing)status("Tuning in\\u2026")});
 audio.addEventListener("playing",()=>{if(playing)status("\\u25cf On air")});
 audio.addEventListener("error",()=>{if(playing){status("Reconnecting\\u2026");
  setTimeout(()=>{if(playing){audio.src=U("/stream","t="+Date.now());audio.play().catch(()=>{})}},3000)}});
+function retune(){if(!playing)return;audio.src=U("/stream","t="+Date.now());audio.play().catch(()=>{})}
 async function skip(dir){const r=await fetch(U("/skip","dir="+dir),{method:"POST"}).catch(()=>null);
- toast(r&&r.ok?(dir==="next"?"Skipping\\u2026":"Going back\\u2026"):"Couldn't skip");setTimeout(refresh,1500);setTimeout(refresh,4000)}
+ toast(r&&r.ok?(dir==="next"?"Skipping\\u2026":"Going back\\u2026"):"Couldn't skip");
+ if(r&&r.ok)setTimeout(retune,400);setTimeout(refresh,1500);setTimeout(refresh,4000)}
+async function skipUpNext(){const r=await fetch(U("/skip","dir=upnext"),{method:"POST"}).catch(()=>null);
+ if(!r||!r.ok)return toast("Couldn't change up next");const j=await r.json();row("next",j.next);toast("Up next changed")}
 const STAR='ICON_STAR';
 for(let i=1;i<=5;i++){const b=document.createElement("button");b.innerHTML=STAR;b.title=b.ariaLabel=i+" star"+(i>1?"s":"");
  b.onclick=()=>setStars(i);b.onmouseenter=()=>paintStars(i);b.onmouseleave=()=>paintStars(cur&&cur.stars||0);$("stars").appendChild(b)}
@@ -1190,10 +1411,70 @@ async function setStars(n){if(!cur||!cur.track||!cur.track.id)return toast("Noth
  if(!res||!res.ok)return toast("Couldn't save rating");const j=await res.json();cur.stars=j.stars;paintStars(j.stars||0);
  toast(j.stars===1?"1 star \\u2014 never again. Skipping":j.stars?j.stars+" stars saved":"Rating cleared");
  if(j.stars===1){setTimeout(refresh,1500);setTimeout(refresh,4000)}}
-$("next").onclick=()=>skip("next");$("back").onclick=()=>skip("back");
+$("next").onclick=()=>skip("next");$("back").onclick=()=>skip("back");$("skipNext").onclick=skipUpNext;
 if("mediaSession" in navigator){navigator.mediaSession.setActionHandler("nexttrack",()=>skip("next"));
  navigator.mediaSession.setActionHandler("previoustrack",()=>skip("back"))}
 refresh();setInterval(refresh,5000);
+
+/* ---- station notes: trivia and bios, written ahead of time ---- */
+function paintNote(el,n,label){
+ if(!n||!(n.trivia||n.bio)){el.hidden=true;return}
+ el.hidden=false;
+ const src=(n.sources||[]).slice(0,2).map((u,i)=>`<a href="${u}" target="_blank" rel="noopener noreferrer">Source ${i+1}</a>`).join(" \\u00b7 ");
+ el.innerHTML=`<span class="k">${label}</span><b>${esc(n.title||"")} \\u00b7 ${esc(n.artist||"")}</b>`+
+  (n.trivia?`<p>${esc(n.trivia)}</p>`:"")+(n.bio?`<p class="k" style="color:var(--muted)">${esc(n.bio)}</p>`:"")+
+  (src?`<div class="src k">${src}</div>`:"")}
+async function loadNotes(){
+ try{const j=await (await fetch(U("/notes.json"),{cache:"no-store"})).json();
+  paintNote($("noteNow"),j.now,"On air now");paintNote($("noteNext"),j.next,"Coming up");
+  $("notesPanel").hidden=$("noteNow").hidden&&$("noteNext").hidden;
+ }catch(e){}}
+loadNotes();setInterval(loadNotes,20000);
+
+/* ---- station chat ---- */
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",\'"\':"&quot;"}[c]));
+let lastId=0,owner=false;
+const STATE={checking:"Checking\\u2026",queued:"With the DJ",held:"Waiting for approval",
+ aired:"On air",ok:"In the chat",blocked:"Not aired"};
+try{$("who").value=localStorage.getItem("wang_name")||""}catch(e){}
+function paintChat(list){
+ const box=$("msgs"),bottom=box.scrollTop+box.clientHeight>=box.scrollHeight-30;
+ for(const m of list){
+  let el=document.getElementById("m"+m.id);
+  if(!el){el=document.createElement("div");el.id="m"+m.id;box.appendChild(el)}
+  el.className="msg "+(m.state==="aired"?"aired":m.state==="blocked"?"blocked":"");
+  el.innerHTML=`<div class="who"><span class="k">${esc(m.name)}</span>`+
+   `<span class="k tag">${esc(STATE[m.state]||m.state)}</span></div>`+
+   `<p>${esc(m.text)}</p>`+(m.note?`<div class="k" style="margin-top:8px;color:var(--muted)">${esc(m.note)}</div>`:"")+
+   (owner&&m.state==="held"?`<div class="ctl"><button class="btn2" data-ok="1" data-id="${m.id}">Read it</button>`+
+    `<button class="btn2" data-ok="0" data-id="${m.id}">Skip it</button></div>`:"");
+  lastId=Math.max(lastId,m.id)}
+ while(box.children.length>60)box.removeChild(box.firstChild);
+ if(bottom)box.scrollTop=box.scrollHeight}
+$("msgs").onclick=async e=>{const b=e.target.closest("button[data-id]");if(!b)return;
+ await fetch(U("/chat/approve"),{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({id:+b.dataset.id,ok:b.dataset.ok==="1"})}).catch(()=>null);
+ b.closest(".ctl").remove();setTimeout(loadChat,300)};
+async function loadChat(){
+ try{const j=await (await fetch(U("/chat.json","since="+lastId),{cache:"no-store"})).json();
+  if(j.off){$("chatPanel").hidden=true;return}
+  $("chatPanel").hidden=false;owner=!!j.owner;
+  if(j.messages&&j.messages.length)paintChat(j.messages);
+  const v=(j.status||{}).vibe||{};
+  $("chatHint").textContent=((j.status||{}).requests&&v.indexed
+   ?"Read on air \\u00b7 "+v.indexed+" tracks searchable":"Read on air by the DJ");
+ }catch(e){}}
+$("say").onsubmit=async e=>{e.preventDefault();
+ const text=$("what").value.trim();if(!text)return;
+ const name=$("who").value.trim();try{localStorage.setItem("wang_name",name)}catch(x){}
+ $("send").disabled=true;
+ const r=await fetch(U("/chat"),{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({name:name,text:text})}).catch(()=>null);
+ $("send").disabled=false;
+ const j=r?await r.json().catch(()=>({})):{};
+ if(j.ok){$("what").value="";loadChat();setTimeout(loadChat,2500);setTimeout(loadChat,6000)}
+ else toast(j.error||"Couldn\'t send that")};
+loadChat();setInterval(loadChat,4000);
 </script></body></html>"""
 
 
@@ -1289,7 +1570,7 @@ textarea{font-family:ui-monospace,Consolas,monospace;font-size:13px;min-height:4
  <span class="chip" id="count"></span><span class="k" id="file"></span></div>
 <div id="groups"></div>
 </main>
-<div class="save" id="savebar" hidden><span class="k" id="msg">No changes</span><button id="save" class="press" disabled>Save <i>changes</i></button></div>
+<div class="save" id="savebar" hidden><span class="k" id="msg">No changes</span><button id="restart" class="press" type="button">Restart <i>station</i></button><button id="save" class="press" disabled>Save <i>changes</i></button></div>
 <div id="toast"></div>
 <script>
 const KQ="%KEY%", $=id=>document.getElementById(id);
@@ -1345,9 +1626,41 @@ $("save").onclick=async()=>{const r=await fetch("/settings.json"+KQ,{method:"POS
  const j=r?await r.json().catch(()=>({})):{};
  if(!r||!j.ok)return toast(j.error||"Couldn't save");
  changes={};toast("Saved \\u2014 restart the station to apply");load()};
+$("restart").onclick=async()=>{
+ if(Object.keys(changes).length&&!confirm("You have unsaved changes. Restart anyway and lose them?"))return;
+ const r=await fetch("/restart"+KQ,{method:"POST",headers:admin?{"X-Admin-Password":admin}:{}}).catch(()=>null);
+ const j=r?await r.json().catch(()=>({})):{};
+ if(!r||!j.ok)return toast(j.error||"Couldn't restart");
+ toast("Restarting... this page reconnects in a few seconds");
+ setTimeout(()=>location.reload(),8000)};
 window.addEventListener("beforeunload",e=>{if(Object.keys(changes).length){e.preventDefault();e.returnValue=""}});
 load();
 </script></body></html>"""
+
+HEALTH = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="30">
+<title>Health &middot; %TITLE%</title>
+%STYLE%
+</head><body>
+<header class="bar"><div class="who"><div><span class="k">Station desk</span><i>%TITLE%</i></div></div>
+<nav class="tabs"><a href="/%KEY%">Stations</a><a href="/settings%KEY%">Settings</a><a class="on" href="/health%KEY%">Health</a></nav></header>
+<main class="wrap wide">
+<section class="hello"><div class="k">Health</div><h1>What's <i>up.</i></h1>
+<p>Each piece the station depends on. This page refreshes every 30 seconds. A piece that is OFF is not in use.</p></section>
+%ROWS%
+</main></body></html>"""
+
+
+def health_page(hub, key):
+    out = []
+    for r in hub.health():
+        state = "up" if r["up"] else "down" if r["up"] is False else "off"
+        out.append(f'<section class="card item {state}"><div><div class="k">{state.upper()}</div>'
+                   f'<div class="name">{html.escape(r["name"])}</div></div>'
+                   f'<div class="help">{html.escape(r["detail"])}</div></section>')
+    return (HEALTH.replace("%TITLE%", html.escape(hub.title)).replace("%KEY%", key)
+            .replace("%ROWS%", "".join(out)))
+
 
 for _name, _svg in ICONS.items():
     PAGE = PAGE.replace("ICON_" + _name.upper(), _svg)
@@ -1508,22 +1821,61 @@ class Station:
         self.tagline = ch["spoken_id"]
         here = os.path.dirname(os.path.abspath(__file__))
         cache = "library_cache.json" if ch.get("first") else f"library_cache_{self.id}.json"
-        self.lib = Library(ch["music"], cfg.get("library", {}).get("rescan_minutes", 30), os.path.join(here, cache))
+        track_filter = self._build_filter(ch, hub)
+        self.lib = Library(ch["music"], cfg.get("library", {}).get("rescan_minutes", 30),
+                           os.path.join(here, cache), track_filter=track_filter)
+        self.dj_breaks = bool(ch.get("dj_breaks", True))
+        self.effects_dir = ch.get("effects", "")
+        self.effects_per_hour = float(cfg.get("ai", {}).get("effects_per_hour", 6))
+        self.effect_times = collections.deque()    # when each effect last played (for effects_per_hour)
         self.ids_dir = ch["station_ids"]
         self.id_interval = float(ch["id_interval"])
         self.id_script = ch["id_script"]
         self.last_id_at, self.last_line = 0.0, None
         self.weather, self.news, self.tts = hub.weather, hub.news, hub.tts
         self.ratings, self.plex = hub.ratings, hub.plex
-        self.ai, self.persona = hub.ai, ch.get("persona", "default")
+        self.ai = hub.ai
+        choice = ch.get("persona", "default")
+        if self.ai and choice == "random":
+            choice = list(self.ai.configured)
+        self.persona_choices = [str(p) for p in choice] if isinstance(choice, list) else [str(choice)]
+        self.persona = self.persona_choices[0]     # who presents the next break
         self.talk = None                           # DJ talk / phone-in being prepared for the next break
         self.phone_busy = False
         clock = cfg.get("clock", {})
         self.window = clock.get("time_window_minutes", 4)
         self.fit = clock.get("fit_top_of_hour", True)
-        self.normalize = cfg.get("audio", {}).get("normalize", True)
+        audio = cfg.get("audio", {})
+        self.normalize = audio.get("normalize", True)
+        # Speech loudness: a touch above the music (-16 LUFS when normalizing), or near typical
+        # mastered-music loudness when songs play as-is. voice_boost_db nudges it either way.
+        self.voice_target = float(audio.get("voice_lufs", -15 if self.normalize else -11)) + \
+            float(audio.get("voice_boost_db", 0))
+        self.voice_target = max(-30.0, min(-5.0, self.voice_target))
+        # Voice-over breaks: the DJ talks over the start of the next song with the music ducked.
+        aicfg = cfg.get("ai", {})
+        self.voiceover_chance = float(aicfg.get("voiceover_chance", 0.3))
+        self.duck_db = float(audio.get("duck_db", -12))
+        self.duck_mode = str(audio.get("duck_mode", "sidechain")).lower()   # "sidechain" or "envelope"
+        # Quiet-intro check for voice-overs (a loudness guide, not vocal detection). Off by default.
+        self.voiceover_quiet_only = bool(aicfg.get("voiceover_quiet_only", False))
+        self.voiceover_max_intro_db = float(aicfg.get("voiceover_max_intro_db", -24))
+        self._intro_cache = {}
+        # Crossfades between songs, in seconds (0 = off). Used only when no DJ talk is due.
+        self.crossfade = float(audio.get("crossfade_seconds", 0))
+        self.head_skip = None                  # (song, seconds) already played by a crossfade
+        # Break batching: the queue keeps this many songs, so the DJ can plan their breaks in one call
+        self.lookahead = max(1, int(aicfg.get("break_batch", 1))) if self.ai else 1
+        self.voiceover_delay = float(audio.get("voiceover_delay", 1.0))
+        self.voiceover = None          # (song, wav, text, persona) waiting for its song
         s = cfg.get("stream", {})
-        self.bc = Broadcaster(kbps=int(str(s.get("bitrate", "128k")).rstrip("k")))
+        self.bc = Broadcaster(burst_seconds=float(s.get("burst_seconds", 4)),
+                              kbps=int(str(s.get("bitrate", "128k")).rstrip("k")))
+        # Only play while someone is listening (stop a little after the last one leaves).
+        self.idle_when_empty = bool(s.get("play_only_when_listening", True))
+        self.idle_grace = float(s.get("stop_after_seconds", 15))
+        self.skip_sounds = bool(cfg.get("controls", {}).get("skip_sounds", True))
+        self.allow_skip = bool(ch.get("allow_skip", True))     # false = a "radio, not a playlist" channel
         self.enc = Encoder(self.bc, s.get("bitrate", "128k"))
         self.done = {"top": None, "half": None, "quarter": None}
         self.last_id = None
@@ -1543,6 +1895,135 @@ class Station:
         self.current_song, self.current_end = None, 0.0
         self.art_cache = collections.OrderedDict()
         self.bc.track = {"id": None, "title": self.name, "artist": "", "album": "", "kind": "station"}
+
+    @staticmethod
+    def _build_filter(ch, hub):
+        """Build a callable(path, info)->bool for genre/artist/star channel filters."""
+        genre = (ch.get("filter_genre") or "").strip().lower()
+        artist = (ch.get("filter_artist") or "").strip().lower()
+        min_stars = int(ch.get("filter_stars") or 0)
+        if not genre and not artist and not min_stars:
+            return None
+        # stars come from the station's own ratings, or from Plex's (which also has ratings
+        # you made in Plexamp). Plex's list is loaded by the AI module, so it may be empty
+        # for the first few minutes after startup.
+        from_plex = (ch.get("filter_stars_from") or "station").lower() == "plex"
+        plex = hub.ai.rotation.plex if (from_plex and hub.ai) else None
+        ratings = None if from_plex else hub.ratings
+
+        def accept(path, info):
+            if genre and genre not in (info.get("genre") or "").lower():
+                return False
+            if artist and artist not in (info.get("artist") or "").lower():
+                return False
+            if min_stars:
+                if from_plex:
+                    track = plex.find(path) if plex else None
+                    s = track.get("stars", 0) if track else 0
+                else:
+                    s = ratings.stars(info.get("id") or track_id(path))
+                if not s or s < min_stars:
+                    return False
+            return True
+        return accept
+
+    def leveled_effect(self, path):
+        """The clip at the voice loudness, as a cached WAV (made once per file; the original
+        file is never changed). Falls back to the original if ffmpeg can't do it."""
+        try:
+            st = os.stat(path)
+            key = hashlib.sha1(f"{path}|{st.st_mtime_ns}|{st.st_size}|{self.voice_target}".encode()).hexdigest()
+            cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "effects_cache")
+            os.makedirs(cache_dir, exist_ok=True)
+            out = os.path.join(cache_dir, key[:16] + ".wav")
+            if os.path.isfile(out) and os.path.getsize(out) > 0:
+                return out
+            tmp = out + ".tmp.wav"
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", path,
+                            "-af", f"loudnorm=I={self.voice_target:.1f}:TP=-1.5:LRA=11,"
+                                   "aresample=44100,aformat=sample_fmts=s16:channel_layouts=stereo",
+                            "-ar", "44100", "-ac", "2", tmp],
+                           capture_output=True, timeout=60, check=True)
+            os.replace(tmp, out)
+            return out
+        except Exception as e:
+            self.log.warning("Couldn't level effect %s (%s); playing it as it is", os.path.basename(path), e)
+            return path
+
+    def random_effect(self):
+        """Pick a random sound effect from the effects folder, or None."""
+        if not self.effects_dir or not os.path.isdir(self.effects_dir):
+            return None
+        files = [os.path.join(self.effects_dir, n)
+                 for n in os.listdir(self.effects_dir)
+                 if os.path.splitext(n)[1].lower() in AUDIO_EXT and not n.startswith(".")]
+        return random.choice(files) if files else None
+
+    def effects_left(self):
+        """How many more effects may play this hour (effects_per_hour is the cap)."""
+        now = time.time()
+        while self.effect_times and now - self.effect_times[0] > 3600:
+            self.effect_times.popleft()
+        return max(0, int(self.effects_per_hour) - len(self.effect_times))
+
+    def note_effect(self):
+        self.effect_times.append(time.time())
+
+    def effect_gaps(self, persona_chance):
+        """Roll for a DJ break: how many sound effects to place inside it (0, 1 or 2)."""
+        if not self.effects_dir or self.effects_left() < 1:
+            return 0
+        if random.random() >= persona_chance:
+            return 0
+        return min(2, self.effects_left())
+
+    def maybe_play_effect(self, persona_chance):
+        """A sound effect on its own, between songs (no DJ talk this time)."""
+        if self.effect_gaps(persona_chance) < 1:
+            return False
+        fx = self.random_effect()
+        if not fx:
+            return False
+        self.log.info("EFFECT: %s", os.path.basename(fx))
+        self.note_effect()
+        self.play(self.leveled_effect(fx), voice=True)
+        if not self.interrupt.is_set():
+            self.enc.silence(0.3)
+        return True
+
+    def talk_with_effects(self, text, persona, out, gaps):
+        """Voice a DJ break with sound effects between its parts, e.g.
+        "this is Bob," [effect] "up next is," [effect] "a great song."
+        Writes one WAV to `out`. Returns False if any part fails."""
+        parts = split_for_effects(text, gaps)
+        seq, temps = [], []
+        try:
+            for i, part in enumerate(parts):
+                if i:
+                    fx = self.random_effect()
+                    if fx:
+                        seq.append(self.leveled_effect(fx))
+                        self.note_effect()
+                fd, p = tempfile.mkstemp(suffix=".wav", prefix="homeradio_part_")
+                os.close(fd)
+                temps.append(p)
+                if not self.ai.speak(part, persona, p):
+                    return False
+                seq.append(p)
+            if len(seq) == 1:
+                os.replace(seq[0], out)
+                return True
+            splice_wavs(seq, out)
+            return True
+        except Exception as e:
+            self.log.warning("DJ break with sound effects failed: %s", e)
+            return False
+        finally:
+            for p in temps:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
 
     # -- song info / history / up next
     def info_for(self, path):
@@ -1568,7 +2049,7 @@ class Station:
         i = self.info_for(path)
         key = f"&key={urllib.parse.quote(self.password)}" if self.password else ""
         return {"id": i["id"], "title": i["title"], "artist": i["artist"], "album": i["album"],
-                "art": f"/art?id={i['id']}{key}"}
+                "duration": round(self.lib.duration(path)[0]), "art": f"/art?id={i['id']}{key}"}
 
     def previous_path(self):
         with self.state_lock:
@@ -1581,9 +2062,10 @@ class Station:
             return self.upcoming[0] if self.upcoming else None
 
     def ensure_upcoming(self):
-        """Always know the next song so the app can show "Up next"."""
+        """Keep the queue filled: "Up next" is the first song, and with break batching the
+        DJ also plans its breaks for the songs behind it (see prepare_talk)."""
         with self.state_lock:
-            if self.upcoming:
+            if len(self.upcoming) >= self.lookahead:
                 return
             remaining = max(0.0, self.current_end - time.time()) if self.current_song else 0.0
         start = dt.datetime.now() + dt.timedelta(seconds=remaining)
@@ -1592,15 +2074,56 @@ class Station:
         ai = self.ai if self.use_ratings else None
         with self.ratings.lock:                    # 1-star songs never play again
             banned = {tid for tid, e in self.ratings.data.items() if e.get("stars") == 1}
-        if self.fit and to_top <= 600:   # near the top of the hour, prefer a song that ends before :00
-            song = self.lib.next(max_seconds=to_top + 30, ratings=ratings, banned=banned, ai=ai)
-        else:
-            song = self.lib.next(ratings=ratings, banned=banned, ai=ai)
-        if song:
+        while True:
             with self.state_lock:
-                if not self.upcoming:
-                    self.upcoming.append(song)
+                if len(self.upcoming) >= self.lookahead:
+                    break
+                first = not self.upcoming
+            if self.fit and first and to_top <= 600:   # near the top of the hour, prefer a song that ends before :00
+                song = self.lib.next(max_seconds=to_top + 30, ratings=ratings, banned=banned, ai=ai)
+            else:
+                song = self.lib.next(ratings=ratings, banned=banned, ai=ai)
+            if not song:
+                break
+            with self.state_lock:
+                self.upcoming.append(song)
             self.info_for(song)
+
+    def request_track(self, path):
+        """A listener's request: put this song next. Returns its info, or None if
+        it's banned, already queued or just played."""
+        if not path or not os.path.isfile(path):
+            return None
+        tid = track_id(path)
+        with self.ratings.lock:
+            if (self.ratings.data.get(tid) or {}).get("stars") == 1:
+                return None
+        with self.state_lock:
+            if path in self.upcoming or path == self.current_song or path in self.history[-5:]:
+                return None
+            self.upcoming.appendleft(path)
+            song, remaining = self.current_song, max(0.0, self.current_end - time.time())
+        info = self.info_for(path)
+        self.log.info("REQUEST: %s", info["display"])
+        if song and remaining > 20:          # the DJ's prepared intro is out of date now
+            self.prepare_talk(song, remaining, keep_persona=True)
+        return info
+
+    def skip_upnext(self):
+        """Swap the up-next song for another one before it plays."""
+        with self.state_lock:
+            old = self.upcoming.popleft() if self.upcoming else None
+        self.ensure_upcoming()
+        new = self.next_path()
+        if old:
+            self.log.info("UP NEXT changed: %s -> %s", self.info_for(old)["display"],
+                          self.info_for(new)["display"] if new else "nothing")
+        # the DJ's prepared intro was about the old song: write a new one
+        with self.state_lock:
+            song, remaining = self.current_song, max(0.0, self.current_end - time.time())
+        if song and remaining > 20:
+            self.prepare_talk(song, remaining, keep_persona=True)
+        return new
 
     def drop_upcoming(self, tid):
         """A song just got 1 star: take it out of "up next" if it's there."""
@@ -1661,6 +2184,8 @@ class Station:
         """Called from the web server thread. Interrupts whatever is on air."""
         if cmd not in ("next", "back", "scratch"):
             return False
+        if cmd in ("next", "back") and not self.allow_skip:      # this channel doesn't allow listener skips
+            return False
         with self.state_lock:
             if cmd == "back" and not self.history:
                 return False
@@ -1684,7 +2209,10 @@ class Station:
             self.log.warning("Sound effect not found: %s", path)
 
     def handle_command(self, cmd):
-        self.play_asset({"next": "next.mp3", "back": "back.mp3", "scratch": "record_scratch.mp3"}[cmd])
+        # Players reconnect after a skip; without the old head start they land right on the new audio.
+        self.bc.clear_burst()
+        if self.skip_sounds or cmd == "scratch":
+            self.play_asset({"next": "next.mp3", "back": "back.mp3", "scratch": "record_scratch.mp3"}[cmd])
         if cmd == "back":
             with self.state_lock:
                 if self.current_song and len(self.history) >= 2:
@@ -1700,19 +2228,120 @@ class Station:
             self.play_song(None)
 
     # -- audio output
-    def play(self, path, title=None, normalize=None, interruptible=True):
+    def nobody_listening(self):
+        return self.idle_when_empty and self.bc.idle_for() > self.idle_grace
+
+    def wait_for_listeners(self):
+        """Nothing plays to an empty room: park here until someone tunes in."""
+        if not self.nobody_listening():
+            return False
+        self.log.info("Nobody listening - station paused until someone tunes in")
+        self._drop_talk(self.talk)
+        self.talk = None
+        if self.voiceover:
+            try:
+                os.unlink(self.voiceover[1])
+            except OSError:
+                pass
+            self.voiceover = None
+        with self.state_lock:
+            self.current_song = None
+        self.bc.title = self.name
+        self.station_track()
+        while self.nobody_listening():
+            self.bc.joined.wait(30)
+            self.bc.joined.clear()
+        self.log.info("Listener tuned in - back on the air")
+        self.bc.clear_burst()
+        return True
+
+    def intro_is_quiet(self, song):
+        """Rough check on a song's opening: quiet enough that a voice-over won't talk over
+        singing. It measures loudness, not voices, so treat it as a guide. Cached per song."""
+        if song in self._intro_cache:
+            return self._intro_cache[song]
+        ok = True
+        try:
+            secs = max(2.0, self.voiceover_delay + 6)
+            r = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-t", f"{secs:.1f}", "-i", song,
+                                "-af", "volumedetect", "-f", "null", "-"],
+                               capture_output=True, text=True, timeout=20)
+            m = re.search(r"mean_volume:\s*(-?[\d.]+) dB", r.stderr)
+            if m:
+                ok = float(m.group(1)) <= self.voiceover_max_intro_db
+        except Exception:
+            ok = True                                  # if we can't tell, keep the normal behaviour
+        if len(self._intro_cache) > 2000:
+            self._intro_cache.clear()
+        self._intro_cache[song] = ok
+        return ok
+
+    def voiceover_args(self, song, wav):
+        """ffmpeg inputs + filters that play `song` with `wav` spoken over its start and the music
+        ducked underneath. None if the song is too short for it."""
+        vlen = probe(wav)[0]
+        slen = self.lib.duration(song)[0]
+        d = max(0.0, self.voiceover_delay)
+        if vlen <= 0 or slen < d + vlen + 8:
+            return None
+        music = "loudnorm=I=-16:TP=-1.5:LRA=11," if self.normalize else ""
+        fmt = f"aresample={RATE},aformat=sample_fmts=s16:channel_layouts=stereo"
+        ms = int(d * 1000)
+        voice = f"[1:a]{voice_filter(wav, self.voice_target)},{fmt},adelay={ms}|{ms},apad"
+        if self.duck_mode == "sidechain":
+            # The voice itself drives the ducking: the music dips only while the DJ is loud.
+            # The ratio is picked so the dip roughly matches duck_db (-12 dB -> about 4.8:1).
+            ratio = max(2.0, min(20.0, -min(0.0, self.duck_db) / 2.5))
+            fc = (f"[0:a]{music}{fmt}[m0];"
+                  f"{voice}[v];"
+                  f"[v]asplit=2[vs][vm];"
+                  f"[m0][vs]sidechaincompress=threshold=0.03:ratio={ratio:.1f}:attack=30:release=600[md];"
+                  f"[md][vm]amix=inputs=2:duration=first:dropout_transition=0,volume=2[out]")
+        else:
+            g = 10 ** (min(0.0, self.duck_db) / 20)            # music level while the DJ talks
+            a, ramp, b = max(0.0, d - 0.6), 0.6, d + vlen + 0.9  # duck from a, back up by b
+            env = (f"volume='1-{1 - g:.4f}*min(1,max(0,(t-{a:.2f})/{ramp}))*min(1,max(0,({b:.2f}-t)/{ramp}))'"
+                   ":eval=frame")
+            fc = (f"[0:a]{music}{fmt},{env}[m];"
+                  f"{voice}[v];"
+                  # both inputs last the whole song (apad), so amix's 1/2 scaling never changes
+                  f"[m][v]amix=inputs=2:duration=first:dropout_transition=0,volume=2[out]")
+        return ["-i", song, "-i", wav, "-filter_complex", fc, "-map", "[out]"]
+
+    def play(self, path, title=None, normalize=None, interruptible=True, voice=False, over=None,
+             start=0.0, trim_end=0.0):
+        """voice=True: a speech clip, brought up to the voice loudness.
+        over=wav: play `path` with that speech mixed over its start (voice-over break).
+        start / trim_end: skip the first `start` seconds, or stop `trim_end` seconds early (crossfades)."""
         if interruptible and self.interrupt.is_set():
             return
         if title:
             self.bc.title = title
-        af = ["-af", "loudnorm=I=-16:TP=-1.5:LRA=11"] if (self.normalize if normalize is None else normalize) else []
-        p = subprocess.Popen(["ffmpeg", "-hide_banner", "-loglevel", "fatal", "-err_detect", "ignore_err", "-i", path, *af,
+        args = self.voiceover_args(path, over) if over else None
+        if args is None:
+            if voice:
+                af = ["-af", voice_filter(path, self.voice_target)]
+            else:
+                af = ["-af", "loudnorm=I=-16:TP=-1.5:LRA=11"] if (self.normalize if normalize is None else normalize) else []
+            cut = []
+            if start > 0:
+                cut += ["-ss", f"{start:.3f}"]
+            if trim_end > 0:
+                cut += ["-t", f"{max(0.1, self.lib.duration(path)[0] - start - trim_end):.3f}"]
+            args = [*cut, "-i", path, *af]
+        self._pump(args, interruptible)
+
+    def _pump(self, args, interruptible=True):
+        """Runs ffmpeg with the given input args and writes its output to the encoder in real time."""
+        p = subprocess.Popen(["ffmpeg", "-hide_banner", "-loglevel", "fatal", "-err_detect", "ignore_err", *args,
                               "-f", "s16le", "-ar", str(RATE), "-ac", str(CHANNELS), "pipe:1"],
                              stdout=subprocess.PIPE)
         chunk = BYTES_PER_SEC // 10
         try:
             while True:
                 if interruptible and self.interrupt.is_set():
+                    break
+                if self.nobody_listening():
                     break
                 data = p.stdout.read(chunk)
                 if not data:
@@ -1723,6 +2352,32 @@ class Station:
                 p.kill()
             p.stdout.close()
             p.wait()
+
+    def crossfade_plan(self, song, dur, nxt, end):
+        """Should the end of `song` overlap the start of `nxt`? Only when the next thing on air is
+        the next song itself: no DJ talk, no time check, no station ID due."""
+        xf = self.crossfade
+        if xf <= 0 or not nxt or nxt == song or self.talk is not None:
+            return False
+        if self.predict_break(end) != "song":
+            return False
+        if self.id_interval > 0 and time.time() + dur - self.last_id_at >= self.id_interval * 60 - 30:
+            return False
+        if dur <= xf * 3 or self.lib.duration(nxt)[0] <= xf * 3:
+            return False
+        return True
+
+    def play_crossfade(self, song, dur, nxt, xf):
+        """The last xf seconds of `song` mixed with the first xf seconds of `nxt`."""
+        loud = "loudnorm=I=-16:TP=-1.5:LRA=11," if self.normalize else ""
+        fmt = f"aresample={RATE},aformat=sample_fmts=s16:channel_layouts=stereo"
+        args = ["-ss", f"{max(0.0, dur - xf):.3f}", "-t", f"{xf:.3f}", "-i", song,
+                "-t", f"{xf:.3f}", "-i", nxt,
+                "-filter_complex",
+                f"[0:a]{loud}{fmt}[a0];[1:a]{loud}{fmt}[a1];"
+                f"[a0][a1]acrossfade=d={xf:.3f}:c1=tri:c2=tri[out]",
+                "-map", "[out]"]
+        self._pump(args, interruptible=True)
 
     def play_song(self, song=None, add_to_history=True):
         """Play a song (or the next one in line). Returns False if there's no music."""
@@ -1745,9 +2400,45 @@ class Station:
             self.current_end = time.time() + dur
         self.set_track(info)
         self.ensure_upcoming()
+        if self.ai:
+            prev = self.history[-2] if len(self.history) >= 2 else None
+            self.ai.note_track(info, self.info_for(prev) if prev else None)
+            nxt = self.next_path()
+            if nxt:
+                self.ai.note_track(self.info_for(nxt), info)
         self.prepare_talk(song, dur)
+        vo, self.voiceover = self.voiceover, None
+        over = None
+        if vo and vo[0] == song:
+            over = vo[1]
+            self.log.info("DJ %s (over the intro): %s", vo[3], vo[2])
         self.log.info("PLAY: %s", info["display"])
-        self.play(song, title=info["display"])
+        start = 0.0
+        if self.head_skip and self.head_skip[0] == song:      # its opening was already played in a crossfade
+            start = self.head_skip[1]
+        self.head_skip = None
+        nxt = self.next_path() if (self.crossfade > 0 and not over and start == 0) else None
+        end = dt.datetime.now() + dt.timedelta(seconds=dur)
+        xf = self.crossfade if (nxt and self.crossfade_plan(song, dur, nxt, end)) else 0
+        try:
+            if xf:
+                self.play(song, title=info["display"], trim_end=xf)      # all but the last xf seconds
+                if not self.interrupt.is_set():
+                    if self.next_path() == nxt:
+                        self.play_crossfade(song, dur, nxt, xf)            # the overlap
+                        self.head_skip = (nxt, xf)
+                    else:                                                 # up next changed: play the tail as it is
+                        self.play(song, start=max(0.0, dur - xf))
+            else:
+                self.play(song, title=info["display"], over=over, start=start)
+            if over and self.ai and not self.interrupt.is_set():
+                self.ai.aired(vo[2], vo[3])
+        finally:
+            if vo:
+                try:
+                    os.unlink(vo[1])
+                except OSError:
+                    pass
         if not self.interrupt.is_set():          # finished on its own (not skipped)
             with self.state_lock:
                 self.current_song = None
@@ -1771,7 +2462,7 @@ class Station:
             try:
                 self.bc.title = self.name
                 self.station_track()
-                self.play(wav)
+                self.play(wav, voice=True)
                 if not self.interrupt.is_set():
                     self.enc.silence(0.4)
             finally:
@@ -1861,11 +2552,12 @@ class Station:
         i = self.info_for(path)
         return {"title": i["title"], "artist": i["artist"], "path": path}
 
-    @staticmethod
-    def _drop_talk(job):
+    def _drop_talk(self, job):
         """Throw away prepared talk. If it's still being made, its thread deletes the audio."""
         if not job:
             return
+        if job.get("shout") and self.ai and self.ai.chat:
+            self.ai.chat.put_back(self.id, job.pop("shout"))
         job["abandoned"] = True
         if job["done"].is_set() and job["wav"]:
             try:
@@ -1873,18 +2565,38 @@ class Station:
             except OSError:
                 pass
 
-    def prepare_talk(self, song, dur):
+    def prepare_talk(self, song, dur, keep_persona=False):
         self._drop_talk(self.talk)
         self.talk = None
+        if not self.dj_breaks:
+            return
+        if not keep_persona and len(self.persona_choices) > 1:
+            others = [p for p in self.persona_choices if p != self.persona]
+            self.persona = random.choice(others or self.persona_choices)   # who hosts the next break
         nxt = self.next_path()
         if not self.ai or not nxt:
             return
         end = dt.datetime.now() + dt.timedelta(seconds=dur)
         kind = self.predict_break(end)
-        phone = kind == "song" and not self.phone_busy and self.ai.phone_in_due()
-        if not phone and not self.ai.wants_to_talk(kind, self.persona):
+        chat = self.ai.chat if self.ai else None
+        shout = chat.take_shoutout(self.id) if chat else None
+        phone = kind == "song" and not self.phone_busy and not shout and self.ai.phone_in_due()
+        if not phone and not shout and not self.ai.wants_to_talk(kind, self.persona):
             return
+        persona = self.persona
+        voiceover = not phone and not shout and random.random() < self.voiceover_chance
+        check_intro = voiceover and self.voiceover_quiet_only
+        gaps = 0 if phone else self.effect_gaps(self.ai.effects_chance(persona))
+        later = []                                     # the songs queued behind this one, for batching
+        if self.lookahead > 1 and not phone:
+            with self.state_lock:
+                queue = list(self.upcoming)[1:]
+            prev_path = nxt
+            for p in queue:
+                later.append({"prev": self.song_ctx(prev_path), "next": self.song_ctx(p)})
+                prev_path = p
         job = {"prev": song, "next": nxt, "text": None, "wav": None, "phone": phone,
+               "persona": persona, "voiceover": voiceover, "shout": shout,
                "done": threading.Event()}
         self.talk = job
         h = end.hour
@@ -1894,15 +2606,23 @@ class Station:
             fd, wav = tempfile.mkstemp(suffix=".wav", prefix="homeradio_dj_")
             os.close(fd)
             try:
-                ctx = {"part_of_day": part, "prev": self.song_ctx(song), "next": self.song_ctx(nxt)}
+                vo_ok = voiceover
+                if check_intro and not self.intro_is_quiet(nxt):
+                    vo_ok = False                      # busy opening: talk between songs instead
+                    job["voiceover"] = False
+                ctx = {"part_of_day": part, "prev": self.song_ctx(song), "next": self.song_ctx(nxt),
+                       "voiceover": vo_ok, "later": later}
+                if shout:
+                    ctx["shoutout"] = {"name": shout["name"], "note": shout["note"],
+                                       "song_queued": shout.get("song")}
                 if phone:
                     self.phone_busy = True
                     ctx["weather"] = self.weather.forecast_text()
-                    if self.ai.make_phone_in(ctx, self.persona, wav):
+                    if self.ai.make_phone_in(ctx, persona, wav):
                         job["wav"], wav = wav, None
                 else:
-                    text = self.ai.write_break(ctx, self.persona)
-                    if text and self.ai.speak(text, self.persona, wav):
+                    text = self.ai.write_break(ctx, persona)
+                    if text and self.talk_with_effects(text, persona, wav, gaps):
                         job["text"], job["wav"], wav = text, wav, None
             except Exception as e:
                 self.log.warning("DJ talk failed: %s", e)
@@ -1923,28 +2643,42 @@ class Station:
         """Play the prepared DJ talk or phone-in, if it's ready and still about the right songs."""
         job, self.talk = self.talk, None
         if not job:
+            # No DJ talk, but maybe a sound effect on its own
+            ec = self.ai.effects_chance(self.persona) if self.ai else 0.3
+            self.maybe_play_effect(ec)
             return
         with self.state_lock:
             prev = self.history[-1] if self.history else None
         ok = (not self.interrupt.is_set() and prev == job["prev"] and self.next_path() == job["next"]
               and job["done"].wait(3))
+        if ok and job["wav"] and job.get("voiceover") and not self.interrupt.is_set():
+            self.voiceover = (job["next"], job["wav"], job["text"], job["persona"])
+            job["wav"] = None                          # play_song owns (and deletes) it now
+            self._drop_talk(job)
+            return
         if ok and job["wav"]:
             if job["phone"]:
-                self.log.info("PHONE-IN")
+                self.log.info("PHONE-IN (%s)", job["persona"])
             else:
-                self.log.info("DJ: %s", job["text"])
+                self.log.info("DJ %s: %s", job["persona"], job["text"])
             self.station_track()
-            self.play(job["wav"])
+            self.play(job["wav"], voice=True)
             if not self.interrupt.is_set():
                 self.enc.silence(0.4)
                 if job["text"]:
-                    self.ai.aired(job["text"], self.persona)
+                    self.ai.aired(job["text"], job["persona"])
+                if job.get("shout") and self.ai.chat:
+                    self.ai.chat.shoutout_aired(self.id, job.pop("shout"), job["text"] or "")
         self._drop_talk(job)
 
     def run(self):
-        self.station_id()
+        started = False
         while True:
             try:
+                if self.wait_for_listeners() or not started:
+                    started = True
+                    self.station_id()            # every time the station comes back on the air
+                    continue
                 cmd = self.take_command()
                 if cmd:
                     self.handle_command(cmd)
@@ -1959,6 +2693,33 @@ class Station:
             except Exception as e:
                 self.log.exception("Playout error: %s", e)
                 time.sleep(1)
+
+def split_for_effects(text, gaps):
+    """Split a DJ break into at most gaps+1 parts at sentence and comma breaks."""
+    text = text.strip()
+    pieces = [p for p in re.split(r"(?<=[.!?,;:])\s+", text) if p]
+    if gaps < 1 or len(pieces) < 2:
+        return [text]
+    n = min(gaps + 1, len(pieces))
+    size = -(-len(pieces) // n)                 # ceiling division
+    return [" ".join(pieces[i:i + size]) for i in range(0, len(pieces), size)]
+
+
+def splice_wavs(parts, out):
+    """parts: WAV paths, joined in order into one WAV. The caller has already leveled
+    the effects, so every piece is at the same loudness."""
+    cmd = ["ffmpeg", "-y", "-v", "error"]
+    for path in parts:
+        cmd += ["-i", path]
+    chains, labels = [], []
+    for i in range(len(parts)):
+        f = "aresample=44100,aformat=sample_fmts=s16:channel_layouts=stereo"
+        chains.append(f"[{i}:a]{f}[a{i}]")
+        labels.append(f"[a{i}]")
+    fc = ";".join(chains) + ";" + "".join(labels) + f"concat=n={len(parts)}:v=0:a=1[out]"
+    cmd += ["-filter_complex", fc, "-map", "[out]", "-ac", "2", "-ar", "44100", out]
+    subprocess.run(cmd, capture_output=True, timeout=60, check=True)
+
 
 def _slug(text):
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "station"
@@ -1988,6 +2749,13 @@ def channel_configs(cfg):
             "logo": os.path.expanduser(c.get("logo", paths.get("logo", "")) or ""),
             "spoken_id": c.get("spoken_id") or (st.get("spoken_id") if i == 0 and not cfg.get("channels")
                                                 else f"You're listening to {name}."),
+            "dj_breaks": c.get("dj_breaks", True),
+            "effects": os.path.expanduser(c.get("effects", paths.get("effects", "")) or ""),
+            "filter_genre": c.get("filter_genre", ""),
+            "filter_artist": c.get("filter_artist", ""),
+            "filter_stars": c.get("filter_stars", 0),
+            "filter_stars_from": c.get("filter_stars_from", "station"),   # "station" or "plex"
+            "allow_skip": c.get("allow_skip", True),   # false: no Next/Back for this channel
         })
     return out
 
@@ -2017,15 +2785,58 @@ class Hub:
         self.stations = collections.OrderedDict()
         for ch in self.channel_cfgs:
             self.stations[ch["id"]] = Station(cfg, self, ch)
+        for cid, station in self.stations.items():
+            if self.ai:
+                self.ai.bind_station(cid, station)
         self.default = next(iter(self.stations.values()))
         log.info("Stations: %s", ", ".join(f"{x.name} ({x.base}/)" for x in self.stations.values()))
         host, port = s.get("host", "0.0.0.0"), int(s.get("port", 8000))
-        srv = ThreadingHTTPServer((host, port), make_handler(self))
+        for attempt in range(20):                # after a restart the old copy may still hold the port
+            try:
+                srv = ThreadingHTTPServer((host, port), make_handler(self))
+                break
+            except OSError:
+                if attempt == 19:
+                    raise
+                time.sleep(1)
         srv.daemon_threads = True
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         log.info("Streaming at http://%s:%s/", host, port)
         self.tunnel = Tunnel(cfg.get("tunnel", {}), port, self.password, cfg.get("notify", {}), self.title)
         threading.Thread(target=self.tunnel.start, daemon=True, name="tunnel").start()
+
+    def health(self):
+        """Everything the health page shows. up = True/False, or None when off or not used."""
+        rows = []
+        try:
+            if self.ai:
+                rows += self.ai.health()
+            else:
+                rows.append({"name": "AI DJ", "up": None, "detail": "off (homeradio_ai.py not loaded)"})
+        except Exception as e:
+            rows.append({"name": "AI DJ", "up": False, "detail": f"check failed: {e}"})
+        if self.plex.enabled:
+            up, detail = _answers(self.plex.url, "/identity")
+        else:
+            up, detail = None, "no Plex token set"
+        rows.append({"name": "Plex", "up": up, "detail": detail})
+        if self.tunnel.provider in ("", "none", "off"):
+            rows.append({"name": "Public link", "up": None, "detail": "off (no tunnel)"})
+        else:
+            rows.append({"name": "Public link", "up": bool(self.tunnel.url),
+                         "detail": self.tunnel.url or "waiting for the tunnel to come up"})
+        rows.append({"name": "ffmpeg", "up": bool(shutil.which("ffmpeg")),
+                     "detail": "on PATH" if shutil.which("ffmpeg") else "not found on PATH"})
+        for st in self.stations.values():
+            n = len(st.lib.files)
+            if not st.lib.ready.is_set():
+                up, detail = False, "still scanning the music folders"
+            elif n:
+                up, detail = True, f"{n} songs"
+            else:
+                up, detail = False, "no songs found"
+            rows.append({"name": f"Music: {st.name}", "up": up, "detail": detail})
+        return rows
 
     def rating_list(self):
         """For the AI rotation: (path, stars, thumbs up, thumbs down) for every rated song."""
@@ -2252,8 +3063,31 @@ def run_tray(hub, cfg, log_path):
     icon.run()
 
 
+def restart_station():
+    """Start a fresh copy of this program, then exit this one. The new copy waits a few
+    seconds (HOMERADIO_RESTART) and retries the web port, so the old copy can let go of it."""
+    log.info("Restarting the station (from the settings page)")
+    for h in logging.getLogger().handlers:
+        try:
+            h.flush()
+        except Exception:
+            pass
+    here = os.path.dirname(os.path.abspath(__file__))
+    flags = 0x00000008 | 0x00000200 if os.name == "nt" else 0   # DETACHED_PROCESS | NEW_PROCESS_GROUP
+    try:
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), CONFIG_PATH],
+                         cwd=here, env=dict(os.environ, HOMERADIO_RESTART="1"),
+                         creationflags=flags, close_fds=True)
+    except OSError as e:
+        log.error("Restart failed: %s", e)
+        return
+    os._exit(0)
+
+
 def main():
     global CONFIG_PATH
+    if os.environ.get("HOMERADIO_RESTART"):
+        time.sleep(4)                                # the previous copy is still shutting down
     cfg_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "radio.toml")
     CONFIG_PATH = os.path.abspath(cfg_path)
     with open(cfg_path, "rb") as f:
