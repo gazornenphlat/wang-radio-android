@@ -9,13 +9,19 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
+import android.graphics.Typeface
 import android.os.Bundle
+import android.view.Gravity
 import android.view.LayoutInflater
+import android.view.View
 import android.widget.EditText
 import android.widget.ImageView
+import android.widget.LinearLayout
+import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.content.res.ResourcesCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
@@ -41,6 +47,10 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         const val EXTRA_OPEN_SETTINGS = "open_settings"
+        private val CHAT_STATES = mapOf(
+            "checking" to "Checking…", "queued" to "With the DJ", "held" to "Waiting for approval",
+            "aired" to "On air", "ok" to "In the chat", "blocked" to "Not aired",
+        )
     }
 
     private lateinit var b: ActivityMainBinding
@@ -55,6 +65,11 @@ class MainActivity : AppCompatActivity() {
     private var currentId: String? = null
     private val starButtons by lazy { listOf(b.star1, b.star2, b.star3, b.star4, b.star5) }
     private var switchTo: String? = null          // station picked on the main screen, to start playing
+    private var chatJob: Job? = null
+    private var chatChannel: String? = null       // the station the chat card is showing
+    private var chatOwner = false
+    private val chatRows = linkedMapOf<Int, LinearLayout>()   // message id -> its view
+    private val chatSigs = mutableMapOf<Int, String>()        // message id -> what it last looked like
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -64,6 +79,8 @@ class MainActivity : AppCompatActivity() {
 
         b.playButton.setOnClickListener { togglePlay() }
         b.settingsButton.setOnClickListener { showSettings() }
+        b.chatSend.setOnClickListener { sendChatMessage() }
+        b.chatName.setText(getSharedPreferences("chat", 0).getString("name", ""))
         b.stationsButton.setOnClickListener { openStations() }
         b.headerBox.setOnClickListener { openStations() }
         starButtons.forEachIndexed { i, btn -> btn.setOnClickListener { setStars(i + 1) } }
@@ -149,6 +166,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
+        startChat()
         val token = SessionToken(this, ComponentName(this, RadioService::class.java))
         controllerFuture = MediaController.Builder(this, token).buildAsync().also { f ->
             f.addListener({
@@ -160,6 +178,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onStop() {
+        stopChat()
         controllerFuture?.let { MediaController.releaseFuture(it) }
         controllerFuture = null
         super.onStop()
@@ -367,8 +386,140 @@ class MainActivity : AppCompatActivity() {
     }
 
 
+    // ------------------------------------------------------------------ station chat
+    /** Refreshes the chat every 5 seconds while the screen is showing. */
+    private fun startChat() {
+        chatJob?.cancel()
+        chatJob = lifecycleScope.launch {
+            while (true) {
+                refreshChat()
+                delay(5000)
+            }
+        }
+    }
+
+    private fun stopChat() {
+        chatJob?.cancel()
+        chatJob = null
+    }
+
+    private suspend fun refreshChat() {
+        val channel = Prefs.channel(this)
+        if (channel != chatChannel) {                     // switched stations: start the chat afresh
+            chatChannel = channel
+            b.chatMsgs.removeAllViews()
+            chatRows.clear()
+            chatSigs.clear()
+        }
+        val feed = api.chat() ?: return
+        if (feed.off) {
+            b.chatBox.visibility = View.GONE
+            return
+        }
+        b.chatBox.visibility = View.VISIBLE
+        chatOwner = feed.owner
+        val shown = feed.messages.takeLast(30)            // the newest 30, like the web page
+        for (m in shown) {
+            val sig = "${m.state}|${m.note}|$chatOwner"
+            if (chatSigs[m.id] == sig) continue            // unchanged: leave its view alone
+            chatSigs[m.id] = sig
+            val row = chatRows[m.id] ?: LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(0, dp(10), 0, dp(10))
+            }.also {
+                chatRows[m.id] = it
+                b.chatMsgs.addView(it)
+            }
+            fillMessage(row, m)
+        }
+        // drop messages that have scrolled out of the newest 30
+        val keep = shown.map { it.id }.toSet()
+        chatRows.keys.filter { it !in keep }.forEach { id ->
+            chatRows.remove(id)?.let { b.chatMsgs.removeView(it) }
+            chatSigs.remove(id)
+        }
+    }
+
+    private fun fillMessage(row: LinearLayout, m: ChatMsg) {
+        row.removeAllViews()
+        row.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(kicker(m.name).apply { layoutParams = LinearLayout.LayoutParams(0, -2, 1f) })
+            addView(kicker(CHAT_STATES[m.state] ?: m.state).apply { setTextColor(color(R.color.muted)) })
+        })
+        row.addView(TextView(this).apply {
+            text = m.text
+            typeface = font(R.font.dmsans)
+            textSize = 15f
+            setTextColor(color(R.color.ink))
+            setPadding(0, dp(6), 0, 0)
+        })
+        m.note?.let { note ->
+            row.addView(TextView(this).apply {
+                text = note
+                typeface = font(R.font.dmsans)
+                textSize = 12f
+                setTextColor(color(R.color.muted))
+                setPadding(0, dp(4), 0, 0)
+            })
+        }
+        if (chatOwner && m.state == "held") {              // owner: read it on air or skip it
+            row.addView(LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(0, dp(8), 0, 0)
+                listOf(getString(R.string.chat_read) to true, getString(R.string.chat_skip) to false).forEach { (label, ok) ->
+                    addView(kicker(label).apply {
+                        background = ContextCompat.getDrawable(context, R.drawable.box_4)
+                        setPadding(dp(12), dp(9), dp(12), dp(9))
+                        layoutParams = LinearLayout.LayoutParams(-2, -2).apply { marginEnd = dp(10) }
+                        setOnClickListener {
+                            lifecycleScope.launch {
+                                if (api.approveChat(m.id, ok)) refreshChat()
+                                else Toast.makeText(this@MainActivity, R.string.chat_failed, Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    })
+                }
+            })
+        }
+    }
+
+    private fun sendChatMessage() {
+        val name = b.chatName.text.toString().trim()
+        val text = b.chatText.text.toString().trim()
+        if (text.isEmpty()) return
+        getSharedPreferences("chat", 0).edit().putString("name", name).apply()
+        b.chatSend.isEnabled = false
+        lifecycleScope.launch {
+            val err = api.sendChat(name, text)
+            b.chatSend.isEnabled = true
+            if (err == null) {
+                b.chatText.setText("")
+                refreshChat()
+            } else {
+                Toast.makeText(this@MainActivity, err, Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    private fun kicker(text: String) = TextView(this).apply {
+        this.text = text
+        setAllCaps(true)
+        letterSpacing = 0.2f
+        textSize = 10f
+        typeface = Typeface.create(font(R.font.dmsans), Typeface.BOLD)
+        setTextColor(color(R.color.ink))
+        includeFontPadding = false
+    }
+
+    private fun font(id: Int): Typeface = ResourcesCompat.getFont(this, id) ?: Typeface.DEFAULT
+    private fun color(id: Int) = ContextCompat.getColor(this, id)
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
     // ------------------------------------------------------------------ settings
     private fun showSettings() {
         startActivity(Intent(this, SettingsActivity::class.java))
     }
+
 }

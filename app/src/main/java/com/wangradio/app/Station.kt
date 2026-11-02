@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -82,6 +83,11 @@ data class Setting(
     val isSet: Boolean,
     val help: String,
 )
+
+/** One station-chat message as the server shows it. state: checking, queued, held, aired, ok, blocked. */
+data class ChatMsg(val id: Int, val name: String, val text: String, val state: String, val note: String?)
+
+data class ChatFeed(val off: Boolean, val owner: Boolean, val messages: List<ChatMsg>)
 
 sealed class SettingsResult {
     data class Loaded(val file: String, val items: List<Setting>) : SettingsResult()
@@ -267,6 +273,61 @@ class StationApi(private val ctx: Context) {
             if (ok && j?.optBoolean("ok") == true) null
             else j?.optString("error")?.takeIf { it.isNotEmpty() && it != "null" } ?: "Server said ${c.responseCode}"
         }.getOrElse { it.message ?: "Can't reach the station" }
+    }
+
+    /** The station chat for the chosen station (messages, and whether this phone owns the station). */
+    suspend fun chat(): ChatFeed? = withContext(Dispatchers.IO) {
+        runCatching {
+            val j = JSONObject(get(withKey("/chat.json", "since=0")))
+            if (j.optBoolean("off")) {
+                ChatFeed(off = true, owner = false, messages = emptyList())
+            } else {
+                val arr = j.optJSONArray("messages") ?: JSONArray()
+                ChatFeed(
+                    off = false,
+                    owner = j.optBoolean("owner"),
+                    messages = (0 until arr.length()).map { i ->
+                        val o = arr.getJSONObject(i)
+                        ChatMsg(
+                            id = o.getInt("id"),
+                            name = o.optString("name"),
+                            text = o.optString("text"),
+                            state = o.optString("state"),
+                            note = o.optString("note").takeIf { it.isNotEmpty() && it != "null" },
+                        )
+                    },
+                )
+            }
+        }.getOrNull()
+    }
+
+    /** Sends a listener message. Returns null when it was accepted, otherwise the reason. */
+    suspend fun sendChat(name: String, text: String): String? = withContext(Dispatchers.IO) {
+        runCatching {
+            val j = post("/chat", JSONObject().put("name", name).put("text", text))
+            if (j.optBoolean("ok")) null else j.optString("error").ifEmpty { "Couldn't send" }
+        }.getOrElse { it.message ?: "Can't reach the station" }
+    }
+
+    /** Owner only: let a held message go on air (ok = true) or skip it. */
+    suspend fun approveChat(id: Int, ok: Boolean): Boolean = withContext(Dispatchers.IO) {
+        runCatching {
+            post("/chat/approve", JSONObject().put("id", id).put("ok", ok)).optBoolean("ok")
+        }.getOrDefault(false)
+    }
+
+    private fun post(path: String, body: JSONObject): JSONObject {
+        val c = URL(withKey(path)).openConnection() as HttpURLConnection
+        c.requestMethod = "POST"
+        c.connectTimeout = 8000; c.readTimeout = 15000
+        c.doOutput = true
+        c.setRequestProperty("Content-Type", "application/json")
+        Prefs.admin(ctx).takeIf { it.isNotEmpty() }?.let { c.setRequestProperty("X-Admin-Password", it) }
+        c.outputStream.use { it.write(body.toString().toByteArray()) }
+        val text = (if (c.responseCode in 200..299) c.inputStream else c.errorStream)
+            ?.bufferedReader()?.use { it.readText() } ?: ""
+        return runCatching { JSONObject(text) }
+            .getOrDefault(JSONObject().put("ok", false).put("error", "Server said ${c.responseCode}"))
     }
 
     private fun get(url: String): String {
