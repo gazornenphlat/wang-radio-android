@@ -116,4 +116,14 @@
     <string name="gate_admin_wrong">That password didn\'t work. Try again.</string>
     <string name="admin_hint">admin_password</string>
     <string name="unlock">Unlock</string>
+
+    <string name="station_chat">Station chat</string>
+    <string name="chat_tagline">Say hello, ask for a vibe</string>
+    <string name="chat_name_hint">Your name</string>
+    <string name="chat_text_hint">Shoutout, or the mood you want…</string>
+    <string name="chat_hint_default">Read on air by the DJ</string>
+    <string name="chat_send">Send</string>
+    <string name="chat_read">Read it</string>
+    <string name="chat_skip">Skip it</string>
+    <string name="chat_failed">Couldn\'t update that message</string>
 </resources>
