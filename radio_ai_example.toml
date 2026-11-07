@@ -125,16 +125,20 @@ max_turns = 6
 
 # ---- Ratings and rotation ------------------------------------------------
 # 1-star songs are never played again (no setting; always on).
-# Similar songs come from the [plex] url/token you already have.
 # If you already have a [ratings] section, add these lines to it.
 [ratings]
 file = "ratings.json"
 # How often a song you rated comes up (1.0 = normal)
 rating_weight = { "2" = 0.4, "3" = 1.0, "4" = 1.2, "5" = 1.4 }
-# Extra chance for songs Plex says are SIMILAR to a song you rated.
-# 0.25 = 25% more often, 1.5 = 2.5x as often.
-similar_boost = { "3" = 0.25, "4" = 0.6, "5" = 1.5 }
-same_artist_share = 0.5        # same artist gets half the boost
+
+# ---- Plex health check ----
+# Checked once a minute. After restart_after_failures checks in a row with no answer, the Plex
+# Media Server service is restarted (net stop / net start; the station keeps running) and the
+# station reconnects. A rejected token never triggers a restart. Empty restart_service = off.
+# [plex]
+# restart_service = "Plex Service"
+# restart_after_failures = 3
+# restart_cooldown_minutes = 30
 
 # ---- Pronunciations (applied before any voice speaks) ------------------
 [pronunciations]

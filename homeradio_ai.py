@@ -7,8 +7,8 @@ What is in here
   2. Personas per channel, each with a notebook of recent lines.
   3. Verified music facts (Wikipedia), cached in facts.json. The DJ may only
      state facts whose source sentence was found word-for-word.
-  4. Ratings: 1-star songs are never played again; 3/4/5-star songs make
-     similar songs (via Plex) more likely; the DJ can mention favorites.
+  4. Ratings: 1-star songs are never played again; 3/4/5-star songs are
+     weighted up. Plex is used only for star ratings (filter_stars_from = "plex").
   5. Voices: piper, kokoro, chatterbox, espeak-ng, or any command.
   6. Pronunciation fixes applied before text-to-speech.
   7. Fake phone-in segments on a configurable schedule.
@@ -613,7 +613,7 @@ class Facts:
 
 
 # --------------------------------------------------------------------------
-# 4. Ratings + Plex similarity -> weighted song choice
+# 4. Ratings -> weighted song choice
 # --------------------------------------------------------------------------
 
 class Ratings:
@@ -624,7 +624,7 @@ class Ratings:
         self.provider = provider
         self.stars = {}      # tail_key(path) -> stars
         self.thumbs = {}     # tail_key(path) -> up - down
-        self.full = {}       # tail_key(path) -> real path (seeds for similarity)
+        self.full = {}       # tail_key(path) -> real path
         self.dirty = True
 
     def refresh(self):
@@ -649,17 +649,15 @@ class Ratings:
 
 
 class PlexSimilar:
-    """Finds songs similar to a rated song. Uses Plex sonic analysis
-    (/nearest) when available, then Plex's similar-artist list, then the same
-    artist."""
+    """Index of the Plex music library, used to look up Plex star ratings
+    (filter_stars_from = "plex"). Refreshed every 6 hours."""
 
     def __init__(self, cfg):
         self.url = (cfg.get("url") or "http://127.0.0.1:32400").rstrip("/")
         self.token = (cfg.get("token") or "").strip()
         self.ok = bool(self.token) and cfg.get("enabled", True)
-        self.tracks = []          # [{key, artist_key, artist, file}]
+        self.tracks = []          # [{key, artist, file, stars}]
         self.by_tail = {}
-        self.cache = {}           # track key -> (close, same)
         self.indexed_at = 0
 
     def _get(self, path, **params):
@@ -679,64 +677,27 @@ class PlexSimilar:
                             # Plex keeps ratings out of 10 (two per star)
                             stars = round(float(t.get("userRating") or 0) / 2)
                             tracks.append({"key": str(t["ratingKey"]),
-                                           "artist_key": str(t.get("grandparentRatingKey", "")),
                                            "artist": t.get("originalTitle") or t.get("grandparentTitle", ""),
                                            "file": p["file"], "stars": stars})
         self.tracks = tracks
         self.by_tail = {tail_key(t["file"]): t for t in tracks}
-        self.cache = {}
         self.indexed_at = time.time()
-        log(f"Plex: indexed {len(tracks)} songs for similar-song picks")
+        log(f"Plex: indexed {len(tracks)} songs (for Plex star ratings)")
 
     def find(self, local_path):
         return self.by_tail.get(tail_key(local_path))
-
-    def similar_files(self, track, limit=40):
-        """Returns (similar songs, same-artist songs) as Plex file paths."""
-        if track["key"] in self.cache:
-            return self.cache[track["key"]]
-        close = []
-        try:
-            mc = self._get(f"/library/metadata/{track['key']}/nearest",
-                           limit=limit, maxDistance=0.25)["MediaContainer"]
-            for t in mc.get("Metadata", []) or []:
-                for m in t.get("Media", []) or []:
-                    for p in m.get("Part", []) or []:
-                        if p.get("file"):
-                            close.append(p["file"])
-        except Exception:
-            pass  # no sonic analysis on this server
-        if not close and track["artist_key"]:
-            try:
-                meta = self._get(f"/library/metadata/{track['artist_key']}")["MediaContainer"]["Metadata"][0]
-                names = {s["tag"].lower() for s in meta.get("Similar", []) or []}
-                close = [t["file"] for t in self.tracks if t["artist"].lower() in names]
-            except Exception:
-                pass
-        same = [t["file"] for t in self.tracks
-                if t["artist_key"] == track["artist_key"] and t["key"] != track["key"]]
-        self.cache[track["key"]] = (close, same)
-        return close, same
 
 
 class Rotation:
     def __init__(self, cfg, plex_cfg, ratings_provider):
         self.ratings = Ratings(ratings_provider)
-        self.plex = PlexSimilar(plex_cfg)
-        # how much more often songs similar to an N-star song come up
-        b = cfg.get("similar_boost", {})
-        self.boost_for = {3: float(b.get("3", 0.25)), 4: float(b.get("4", 0.6)),
-                          5: float(b.get("5", 1.5))}
-        self.same_artist_share = float(cfg.get("same_artist_share", 0.5))
+        self.plex = PlexSimilar(plex_cfg)          # Plex library index, for Plex star ratings only
         r = cfg.get("rating_weight", {})
         self.own_weight = {2: float(r.get("2", 0.4)), 3: float(r.get("3", 1.0)),
                            4: float(r.get("4", 1.2)), 5: float(r.get("5", 1.4))}
-        self.boost = {}             # tail_key -> extra weight
-        self.dirty = True
 
     def rating_changed(self):
         self.ratings.dirty = True
-        self.dirty = True
 
     def banned(self, path):
         self.ratings.refresh()
@@ -754,7 +715,7 @@ class Rotation:
             w *= 0.3
         elif t > 0:
             w *= 1.3
-        return w * (1.0 + self.boost.get(k, 0.0))
+        return w
 
     def choose(self, candidates, rng=random):
         """Pick one path from candidates. Never returns a 1-star song."""
@@ -766,41 +727,17 @@ class Rotation:
 
     def start(self):
         if self.plex.ok:
-            threading.Thread(target=self._loop, daemon=True, name="ai-rotation").start()
+            threading.Thread(target=self._loop, daemon=True, name="plex-index").start()
 
     def _loop(self):
         while True:
             try:
-                stale = time.time() - self.plex.indexed_at > 6 * 3600
-                if stale:
+                if time.time() - self.plex.indexed_at > 6 * 3600:
                     self.plex.index()
-                if stale or self.dirty:
-                    self.dirty = False
-                    self._rebuild()
             except Exception as e:
-                log(f"similar songs: Plex update failed ({e}); trying again later")
+                log(f"Plex: library index update failed ({e}); trying again later")
                 time.sleep(600)
             time.sleep(30)
-
-    def _rebuild(self):
-        self.ratings.dirty = True
-        self.ratings.refresh()
-        boost = {}
-        seeds = [(self.ratings.full[k], s) for k, s in self.ratings.stars.items() if s >= 3]
-        found = 0
-        for path, stars in seeds:
-            track = self.plex.find(path)
-            if not track:
-                continue
-            found += 1
-            b = self.boost_for[stars]
-            close, same = self.plex.similar_files(track)
-            for f, amount in [(f, b) for f in close] + [(f, b * self.same_artist_share) for f in same]:
-                k = tail_key(f)
-                boost[k] = max(boost.get(k, 0.0), amount)
-        self.boost = boost
-        log(f"similar songs: {found} of {len(seeds)} rated songs found in Plex, "
-            f"{len(boost)} similar songs boosted")
 
 
 # --------------------------------------------------------------------------
@@ -1223,7 +1160,7 @@ class Station:
                 f"phone-ins: {f'{self.phone.per_day} a day' if self.phone.enabled else 'off'}; "
                 f"chat: {'on' if (self.chat and self.chat.enabled) else 'off'}")
         else:
-            log("DJ off ([ai] enabled = false); ratings and similar songs still active")
+            log("DJ off ([ai] enabled = false); ratings still active")
 
     def persona(self, key=None):
         return self.personas.get(key or "default", self.personas["default"])
@@ -1377,7 +1314,7 @@ if __name__ == "__main__":
     import argparse
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     ap = argparse.ArgumentParser(description="HomeRadio AI self-tests")
-    ap.add_argument("command", choices=["break", "voice", "facts", "phone-in", "similar"])
+    ap.add_argument("command", choices=["break", "voice", "facts", "phone-in", "plex"])
     ap.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "radio.toml"))
     ap.add_argument("--persona", default="default")
     ap.add_argument("--artist", default="Fleetwood Mac")
@@ -1406,11 +1343,9 @@ if __name__ == "__main__":
         print(json.dumps(st.facts.lookup(a.artist), indent=1))
     elif a.command == "phone-in":
         print(st.make_phone_in(demo, a.persona, "test_call.wav") or "failed (see log)")
-    elif a.command == "similar":
+    elif a.command == "plex":
         if not st.rotation.plex.ok:
             print("No Plex token in [plex]")
         else:
             st.rotation.plex.index()
-            st.rotation._rebuild()
-            for k, b in sorted(st.rotation.boost.items(), key=lambda kv: -kv[1])[:25]:
-                print(f"+{b:.2f}  {k}")
+            print(f"{len(st.rotation.plex.tracks)} songs indexed from Plex")

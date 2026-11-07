@@ -16,7 +16,7 @@ import shutil, subprocess, sys, tempfile, threading, time, tomllib, urllib.error
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-try:                                   # AI DJ, voices, phone-ins, similar songs (optional)
+try:                                   # AI DJ, voices, phone-ins, ratings (optional)
     import homeradio_ai
 except Exception as _e:                # missing or broken: the station runs exactly as before
     homeradio_ai = None
@@ -209,6 +209,14 @@ class Plex:
             self.keys[info["id"]] = fallback
         return fallback
 
+    def reconnect(self):
+        """Forget the cached connection and look Plex up again. The same object is kept,
+        so everything that holds it keeps working. The station is not touched."""
+        self.sections = None
+        self.keys = {}
+        if self.enabled:
+            self.jobs.put(("check", None, None))
+
     def rate(self, info, stars):
         if self.enabled:
             self.jobs.put(("rate", info, stars))
@@ -236,6 +244,97 @@ class Plex:
                             " - check your Plex token" if e.code == 401 else "")
             except Exception as e:
                 log.warning("Plex not reachable (%s): %s", self.url, e)
+
+
+def plex_state(url, token, timeout=10):
+    """'ok', 'bad token' or 'down'. No answer or a server error (5xx) counts as down.
+    A rejected token is not a restart case: restarting Plex would not fix it."""
+    try:
+        req = urllib.request.Request(f"{url.rstrip('/')}/library/sections",
+                                     headers={"X-Plex-Token": token, "Accept": "application/json",
+                                              "User-Agent": "HomeRadio/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout):
+            return "ok"
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return "bad token"
+        return "down" if e.code >= 500 else "ok"
+    except Exception:
+        return "down"
+
+
+class PlexWatch:
+    """Health check for Plex, once a minute. After several failures in a row it restarts the
+    Plex Media Server Windows service (not this station), then reconnects the station to
+    Plex in place. A rejected token never triggers a restart, and restarts are spaced out
+    by a cooldown so a broken Plex cannot cause a restart loop."""
+
+    def __init__(self, cfg, hub):
+        self.hub = hub
+        self.service = (cfg.get("restart_service", "Plex Service") or "").strip()
+        self.after = max(1, int(cfg.get("restart_after_failures", 3)))
+        self.cooldown = float(cfg.get("restart_cooldown_minutes", 30)) * 60
+        self.state = "checking"
+        self.restarts = 0
+        self._fails = 0
+        self._last_restart = 0.0
+
+    def run(self):
+        while True:
+            time.sleep(60)
+            try:
+                self.check()
+            except Exception as e:
+                log.warning("Plex watch: %s", e)
+
+    def check(self):
+        p = self.hub.plex
+        self.state = plex_state(p.url, p.token)
+        if self.state == "ok":
+            if self._fails:
+                log.info("Plex is answering again")
+            self._fails = 0
+            return
+        if self.state == "bad token":
+            log.warning("Plex: token rejected - check [plex] token (not restarting Plex)")
+            return
+        self._fails += 1
+        if self._fails < self.after:
+            log.warning("Plex not answering (%s), check %d of %d", p.url, self._fails, self.after)
+            return
+        if not self.service:
+            log.warning("Plex not answering; automatic restart is off ([plex] restart_service is empty)")
+            return
+        if time.time() - self._last_restart < self.cooldown:
+            return                                   # restarted recently; give it time
+        self._last_restart = time.time()
+        self.restarts += 1
+        self._restart_service()
+        time.sleep(60)
+        self.state = plex_state(p.url, p.token)
+        log.info("Plex after restart: %s", self.state)
+        if self.state == "ok":
+            self._fails = 0
+            p.reconnect()
+            ai = self.hub.ai
+            if ai and ai.rotation.plex.ok:
+                try:
+                    ai.rotation.plex.index()
+                except Exception as e:
+                    log.warning("Plex: library index failed after restart (%s)", e)
+
+    def _restart_service(self):
+        log.warning("Plex not answering: restarting the '%s' service", self.service)
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)     # no console flash under pythonw
+        for verb in ("stop", "start"):
+            try:
+                r = subprocess.run(["net", verb, self.service], capture_output=True, text=True,
+                                   timeout=180, creationflags=flags)
+                lines = (r.stdout + r.stderr).strip().splitlines()
+                log.info("net %s '%s': %s", verb, self.service,
+                         lines[-1] if lines else f"exit code {r.returncode}")
+            except Exception as e:
+                log.warning("net %s '%s' failed: %s", verb, self.service, e)
 
 
 def _answers(url, path="", timeout=2.0):
@@ -393,7 +492,7 @@ class Library:
     def next(self, max_seconds=None, ratings=None, banned=None, ai=None):
         """Pick a track; if max_seconds is given, try to find one that fits.
         banned: track ids that must never play (1-star songs).
-        With ai: weighted by stars and by songs similar to the ones you rated.
+        With ai: weighted by your star ratings.
         With ratings only: thumbs-down songs come up much less often, thumbs-up a bit more."""
         pool = self._candidates()
         if banned:
@@ -2781,6 +2880,9 @@ class Hub:
                 self.ai = homeradio_ai.Station(cfg, here, self.rating_list, self.tts.render)
             except Exception as e:
                 log.warning("AI features off - setup failed: %s", e)
+        self.plex_watch = PlexWatch(cfg.get("plex", {}), self)
+        if self.plex.enabled:
+            threading.Thread(target=self.plex_watch.run, daemon=True, name="plex-watch").start()
         self.channel_cfgs = channel_configs(cfg)
         self.stations = collections.OrderedDict()
         for ch in self.channel_cfgs:
@@ -2816,7 +2918,12 @@ class Hub:
         except Exception as e:
             rows.append({"name": "AI DJ", "up": False, "detail": f"check failed: {e}"})
         if self.plex.enabled:
-            up, detail = _answers(self.plex.url, "/identity")
+            state = plex_state(self.plex.url, self.plex.token, timeout=5)
+            up = state == "ok"
+            detail = {"ok": "answering", "bad token": "token rejected - check [plex] token",
+                      "down": "not answering"}[state]
+            if self.plex_watch.restarts:
+                detail += f" (watchdog restarted Plex {self.plex_watch.restarts}x)"
         else:
             up, detail = None, "no Plex token set"
         rows.append({"name": "Plex", "up": up, "detail": detail})

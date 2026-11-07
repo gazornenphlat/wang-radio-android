@@ -52,9 +52,13 @@ WANG Radio Android app.
 - Voice-overs: `voiceover_chance`, `duck_db`, `duck_mode` ("sidechain" default, or "envelope").
   `voiceover_quiet_only` checks intro loudness (a proxy, not vocal detection).
 - Crossfades: `[audio] crossfade_seconds`. Used only when no DJ talk, time check or station ID is due.
-- Similar-song boost uses Plex (`/nearest`, similar artists, same artist); 3-star a little, 5-star a lot.
+- Plex is used for star ratings (`filter_stars_from = "plex"`) and the health check. Similar-song picks were removed.
+- Plex health: checked every minute (`PlexWatch` in radio.py). After `restart_after_failures` (3) failed
+  checks in a row, the Plex Media Server service (`[plex] restart_service`, default "Plex Service") is
+  restarted with `net stop` / `net start`, then the station reconnects to Plex. The station is not
+  restarted. A rejected token never restarts Plex. Restarts are at least `restart_cooldown_minutes` (30) apart.
 - Phone-ins: `[ai.phone_in]`, produced in the background.
-- Self-tests: `python homeradio_ai.py break|voice|facts|phone-in|similar`.
+- Self-tests: `python homeradio_ai.py break|voice|facts|phone-in|plex`.
 
 ## Channels
 - `[[channels]]` entries: `music`, `persona`, `dj_breaks`, `effects`, `filter_genre`, `filter_artist`,
