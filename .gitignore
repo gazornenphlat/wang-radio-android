@@ -1,34 +1,47 @@
-# secrets and per-machine state
-radio*.toml
-!radio_ai_example.toml
+# ---- Secrets and personal config: never commit ----
+radio.toml
+radio.toml.bak
+*.env
+.env
+
+# ---- Per-station state written at runtime ----
 ratings.json
-ratings_log.csv
 facts.json
 notebook_*.json
-phone_in_state.json
-public_url.txt
-library_cache*.json
-radio.log*
+vibes.jsonl
+chat_log.csv
+social_feed.jsonl
+notes.json
+effects_cache/
 *.log
-*.tmp
-*.bak
+radio.log
+
+# ---- Python ----
 __pycache__/
-.sync/
+*.pyc
+.pytest_cache/
 
-# build output / archives
-*.apk
-*.zip
+# ---- Test output ----
+test_run_*/
+tmp_station_*/
 
-# Android build output
-android/.gradle/
-android/build/
-android/app/build/
-android/local.properties
-WANG-Radio-Android/**/.gradle/
-WANG-Radio-Android/**/build/
-WANG-Radio-Android/**/local.properties
+# ---- Android (no Gradle wrapper in this repo; GitHub Actions builds the APK) ----
 .gradle/
 build/
+app/build/
 local.properties
-*.iml
+*.apk
+*.aab
+*.keystore
+*.jks
 .idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+
+# ---- OS / editor ----
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/

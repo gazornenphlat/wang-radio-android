@@ -3,11 +3,28 @@
 [ai]
 enabled = true            # false = templates only, exactly like today
 facts = true              # look up verified artist facts on Wikipedia
-timeout_seconds = 25
+vibe_search = true              # listeners can ask for a mood and get a matching track
+vibe_dims = 256                 # embedding size kept per track (smaller = faster searches)
+research = true                 # Wikipedia + MusicBrainz lookups for trivia and bios
+research_ttl_days = 90
+show_notes = true               # trivia, bios and transition lines for the dashboard
+social_feed = true              # also append each one to social_feed.jsonl
+voiceover_chance = 0.3          # share of DJ breaks spoken over the next song's intro
+effects_per_hour = 6            # max sound effects per hour (from the effects folder)
+break_batch = 1                 # 2-4: plan this many upcoming breaks in ONE model call (fewer calls, same words)
+voiceover_quiet_only = false    # true: only talk over an intro that is quiet enough (see below)
+voiceover_max_intro_db = -24    # loudness limit for "quiet" intros (mean dB over the first seconds)
+timeout_seconds = 120          # how long to wait for Ollama (DJ talk, phone-ins)
+background_timeout_seconds = 120   # artist fact lookups
 
 # Which model does which job: "provider:model". Ollama by default.
 [ai.models]
 talk     = "ollama:llama3.1:8b"
+# Vibe search needs an embedding model: ollama pull nomic-embed-text
+embed    = "ollama:nomic-embed-text"
+# chat (safety screening), vibe (mood -> search terms) and notes (trivia/bios)
+# fall back to the talk model unless you name one here.
+# chat   = "ollama:llama3.1:8b"
 facts    = "ollama:llama3.1:8b"
 phone_in = "ollama:llama3.1:8b"
 # talk = "claude:claude-sonnet-5"      # example: hosted model for on-air talk only
@@ -15,6 +32,9 @@ phone_in = "ollama:llama3.1:8b"
 [ai.providers.ollama]
 type = "ollama"
 url  = "http://localhost:11434"
+# Several computers? List them in order of preference. The first one that answers is used,
+# a switched-off one is skipped (re-checked every 30 s), and nothing waits on it.
+# url = ["http://gaming-pc:11434", "http://localhost:11434"]
 
 # Optional hosted APIs. Unused unless a model above names them.
 # Put keys in environment variables rather than this file.
@@ -27,13 +47,43 @@ type = "openai"                        # any OpenAI-compatible server
 url  = "https://api.openai.com/v1"     # or Groq, OpenRouter, LM Studio, vLLM...
 api_key_env = "OPENAI_API_KEY"
 
+# LM Studio: start its server (Developer tab -> Start Server), then use
+# talk = "lmstudio:<model id shown in LM Studio>" in [ai.models]
+[ai.providers.lmstudio]
+type = "openai"
+url  = "http://localhost:1234/v1"
+json_mode = false
+
 # ---- Voices --------------------------------------------------------------
-# Kokoro and Chatterbox run as small local servers with an
-# OpenAI-style /v1/audio/speech endpoint (e.g. Kokoro-FastAPI,
-# chatterbox-tts-api). If a voice fails, espeak-ng is used instead.
+# engine = "default" uses your normal [tts] voice. Kokoro and Chatterbox run
+# as small local servers (Kokoro-FastAPI, chatterbox-tts-api). If a voice
+# server is down, the station quietly uses your normal [tts] voice instead.
+# Caller voices by gender. Phone-in callers get a man's or woman's name AND a matching voice.
+# Kokoro names: af_/bf_ = female, am_/bm_ = male. Windows voices: engine = "windows",
+# voice = "Microsoft Zira Desktop" (female) / "Microsoft David Desktop" (male).
+[ai.voices]
+female = [
+  { engine = "kokoro", voice = "af_sarah" },
+  { engine = "kokoro", voice = "af_nicole" },
+  { engine = "kokoro", voice = "bf_emma" },
+]
+male = [
+  { engine = "kokoro", voice = "am_adam" },
+  { engine = "kokoro", voice = "bm_george" },
+  { engine = "kokoro", voice = "bm_lewis" },
+]
+
 [ai.voices.kokoro]
-url   = "http://localhost:8880"
+url   = "http://localhost:8880"        # or a list, same failover as providers: ["http://gaming-pc:8880", "http://localhost:8880"]
 model = "kokoro"
+
+# VoiceStudio (runs on this PC; its OpenAI-style speech endpoint). voice = a VoiceStudio voice
+# profile id or name from http://localhost:3900/v1/audio/voices. model = a VoiceStudio engine id
+# (omnivoice-subprocess is killable on timeout) or "tts-1" for whichever engine VoiceStudio is using.
+# [ai.voices.voicestudio]
+# url = "http://localhost:3900"
+# model = "omnivoice-subprocess"
+# timeout = 300
 
 [ai.voices.chatterbox]
 url   = "http://localhost:4123"
@@ -45,10 +95,16 @@ binary = "piper"
 
 # ---- Personas (one per channel) --------------------------------------------
 [ai.personas.default]
-name = "Tito"
-style = "Morning zoo radio, wacky, silly, puns."
-talkativeness = 0.7                    # 0 = says almost nothing, 1 = chatty
-voice = { engine = "kokoro", voice = "bm_atten_inno" }
+name = "Dana"
+style = "Warm, relaxed and a little dry. A late-night FM host who loves the records."
+talkativeness = 0.5                    # 0 = says almost nothing, 1 = chatty
+max_words = 80                         # longest a break can be (overrides talkativeness)
+talk_between_songs = 0.6               # chance of talking between ordinary songs (0-1)
+humor = 0.7                            # 0 = straight host, 1 = a joke/pun/bit nearly every break
+effects_chance = 0.3                   # chance of playing a sound effect per DJ break (0-1)
+jokes_file = "jokes.txt"               # optional: your own jokes, one per line, worked in now and then
+# bits = ["make a pun on the next song's title", "tell a dad joke"]   # optional: your own list of things to try
+voice = { engine = "kokoro", voice = "af_bella" }
 # voice = { engine = "chatterbox", voice = "dana_sample" }
 # voice = { engine = "piper", model = "/home/YOURUSER/piper/en_US-amy-medium.onnx" }
 caller_voices = [
@@ -60,30 +116,37 @@ caller_voices = [
 [ai.personas.rock]
 name = "Mick"
 style = "High energy, punchy, short sentences, classic-rock DJ swagger."
-talkativeness = 0.6
-voice = { engine = "kokoro", voice = "bm_george" }
+talkativeness = 0.3
+voice = { engine = "kokoro", voice = "am_michael" }
 
 # In each [[channels]] entry, add:   persona = "rock"
-# Channels without one use "default".
+# Channels without one use "default". The DJ voice reads the time, weather,
+# news and its own talk; script station IDs keep your normal [tts] voice.
 
 # ---- Fake phone-in calls -------------------------------------------------
 [ai.phone_in]
 enabled = true
-per_day = 12                    # how many calls a day
+per_day = 2                    # how many calls a day
 between_hours = [10, 21]       # only between 10:00 and 21:00
-min_gap_hours = 1              # at least this long between calls
-max_turns = 12
+min_gap_hours = 3              # at least this long between calls
+max_turns = 6
 
 # ---- Ratings and rotation ------------------------------------------------
 # 1-star songs are never played again (no setting; always on).
+# If you already have a [ratings] section, add these lines to it.
 [ratings]
 file = "ratings.json"
 # How often a song you rated comes up (1.0 = normal)
 rating_weight = { "2" = 0.4, "3" = 1.0, "4" = 1.2, "5" = 1.4 }
-# Extra chance for songs Plex says are SIMILAR to a song you rated.
-# 0.25 = 25% more often, 1.5 = 2.5x as often.
-similar_boost = { "3" = 0.25, "4" = 0.6, "5" = 1.5 }
-same_artist_share = 0.5        # same artist gets half the boost
+
+# ---- Plex health check ----
+# Checked once a minute. After restart_after_failures checks in a row with no answer, the Plex
+# Media Server service is restarted (net stop / net start; the station keeps running) and the
+# station reconnects. A rejected token never triggers a restart. Empty restart_service = off.
+# [plex]
+# restart_service = "Plex Service"
+# restart_after_failures = 3
+# restart_cooldown_minutes = 30
 
 # ---- Pronunciations (applied before any voice speaks) ------------------
 [pronunciations]
@@ -91,3 +154,65 @@ same_artist_share = 0.5        # same artist gets half the boost
 "AC/DC" = "A C D C"
 "Hozier" = "Hoe-zeer"
 "Mötley Crüe" = "Motley Crew"
+
+# ---- Voice levels and voice-overs (goes in your existing [audio] section) ----
+# [audio]
+# voice_boost_db = 0     # voices louder (+) or quieter (-) than the default, in dB
+# duck_db = -12          # how far the music dips while the DJ talks over it
+# voiceover_delay = 1.0  # seconds into the song before the DJ starts talking
+# crossfade_seconds = 0  # e.g. 4: songs fade into each other (skipped when the DJ or a station ID is due)
+# duck_mode = "sidechain" # "sidechain" (smooth, follows the voice) or "envelope" (simpler)
+
+# ---- Station chat -------------------------------------------------------
+# Listeners type into the chat at the bottom of the web player. Every message is
+# screened before anything reaches the air, and the DJ always writes its own
+# words - a listener's text is never spoken as typed.
+[chat]
+enabled = true
+allow_requests = true           # "play something that feels like..." queues a track
+require_approval = false        # true = nothing airs until you approve it in the chat
+messages_per_minute = 4         # per listener
+messages_per_hour = 40
+shoutouts_per_hour = 6          # how often the DJ will read one out
+keep_messages = 60
+blocked_words = []              # your own additions, e.g. ["crypto", "my boss"]
+
+# ---- Channel examples ---------------------------------------------------
+# Each [[channels]] block is one station. All three new features shown:
+
+# A rock-only channel with no DJ breaks, pulling from the same music folder
+# but filtering to tracks whose genre tag contains "rock".
+# [[channels]]
+# id = "rock"
+# name = "WANG Rock"
+# music = ["T:\\Music"]
+# filter_genre = "rock"
+# persona = "rock"
+# dj_breaks = false
+# effects = "T:\\sync\\radio\\effects"
+
+# A "best of" channel: only songs you rated 4 stars or higher.
+# filter_stars_from = "station" (default) uses this station's ratings;
+# "plex" uses the star ratings in Plex, including ones you made in Plexamp.
+# [[channels]]
+# id = "best"
+# name = "WANG Gold"
+# music = ["T:\\Music"]
+# filter_stars = 4
+# filter_stars_from = "plex"
+# persona = "default"
+
+# A channel with no Next / Back buttons (listeners can't skip; the server refuses skips too).
+# [[channels]]
+# id = "nonstop"
+# name = "WANG Nonstop"
+# music = ["T:\\Music"]
+# allow_skip = false
+
+# A single-artist channel.
+# [[channels]]
+# id = "floyd"
+# name = "All Floyd"
+# music = ["T:\\Music"]
+# filter_artist = "Pink Floyd"
+# dj_breaks = false
