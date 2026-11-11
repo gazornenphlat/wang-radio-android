@@ -1,39 +1,3 @@
-# secrets and per-machine state
-radio*.toml
-!radio_ai_example.toml
-ratings.json
-ratings_log.csv
-facts.json
-notebook_*.json
-phone_in_state.json
-public_url.txt
-library_cache*.json
-radio.log*
-*.log
-*.tmp
-*.bak
-__pycache__/
-.sync/
-
-# build output / archives
-*.apk
-*.zip
-
-# Android build output
-android/.gradle/
-android/build/
-android/app/build/
-android/local.properties
-WANG-Radio-Android/**/.gradle/
-WANG-Radio-Android/**/build/
-WANG-Radio-Android/**/local.properties
-.gradle/
-build/
-local.properties
-*.iml
-.idea/
-
-# ---- station (server) ----
 # ---- Secrets and personal config: never commit ----
 radio.toml
 radio.toml.bak

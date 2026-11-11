@@ -17,6 +17,7 @@ Last updated 2026-11-02. "Live" means run against the real station or real hardw
 | Two-computer failover | Session test: dead address first, live one answers; down marked | No (no two real hosts) |
 | `allow_skip = false` | Server refuses next/back and web hides buttons; owner reports working live 2026-11-02; not in harness | Owner report only |
 | Plex health check and auto-restart (`PlexWatch`) | Unit: 12 checks with a fake Plex server (401 vs down, 3-strike restart, cooldown, reconnect); harness: Plex health row up | No (`net stop`/`start` not run on Windows) |
+| Tunnel restarts (cloudflared) | Fake cloudflared: link announced once over 10 restarts, last output logged, backoff grows. Real cloudflared not run | No |
 | Restart button (`/restart`) | Owner reports working live 2026-11-02; not in harness | Owner report only |
 | Android chat | CI compile only, not confirmed | No |
 

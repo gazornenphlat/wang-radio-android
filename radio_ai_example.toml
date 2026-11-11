@@ -77,6 +77,14 @@ male = [
 url   = "http://localhost:8880"        # or a list, same failover as providers: ["http://gaming-pc:8880", "http://localhost:8880"]
 model = "kokoro"
 
+# VoiceStudio (runs on this PC; its OpenAI-style speech endpoint). voice = a VoiceStudio voice
+# profile id or name from http://localhost:3900/v1/audio/voices. model = a VoiceStudio engine id
+# (omnivoice-subprocess is killable on timeout) or "tts-1" for whichever engine VoiceStudio is using.
+# [ai.voices.voicestudio]
+# url = "http://localhost:3900"
+# model = "omnivoice-subprocess"
+# timeout = 300
+
 [ai.voices.chatterbox]
 url   = "http://localhost:4123"
 model = "chatterbox"

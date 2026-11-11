@@ -1778,6 +1778,7 @@ class Tunnel:
         self.notify, self.station = notify or {}, station
         self.provider = cfg.get("provider", "none").lower()
         self.url, self.proc = None, None
+        self._last_announced = None           # the link last sent out (no repeat pushes)
 
     def start(self):
         if self.provider in ("", "none", "off"):
@@ -1802,6 +1803,12 @@ class Tunnel:
 
     def _cloudflare(self):
         exe = self._exe("cloudflared")
+        found = threading.Event()
+        threading.Thread(target=self._cloudflare_supervisor, args=(exe, found),
+                         daemon=True, name="tunnel").start()
+        found.wait(30)
+
+    def _cloudflare_args(self, exe):
         token = self.cfg.get("cloudflare_token", "")
         if token:
             args = [exe, "tunnel", "--no-autoupdate", "run", "--token", token]
@@ -1814,33 +1821,51 @@ class Tunnel:
         proto = self.cfg.get("cloudflare_protocol", "http2")
         if proto and proto != "auto":
             args[2:2] = ["--protocol", proto]
-        self.proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                     text=True, encoding="utf-8", errors="replace")
-        found = threading.Event()
+        return args
 
-        def watch():
-            import re
-            announced = None
+    def _cloudflare_supervisor(self, exe, found):
+        """Runs cloudflared and restarts it when it exits. Backs off (10 s, 20 s, ... up to 5 min)
+        so a tunnel that keeps failing doesn't restart every few seconds. When it exits, the last
+        lines it printed are logged, since that is usually the reason."""
+        import re
+        token = self.cfg.get("cloudflare_token", "")
+        delay = 10
+        while True:
+            started = time.time()
+            try:
+                self.proc = subprocess.Popen(self._cloudflare_args(exe), stdout=subprocess.PIPE,
+                                             stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                                             errors="replace")
+            except OSError as e:
+                log.error("Tunnel: couldn't start cloudflared: %s", e)
+                time.sleep(delay)
+                delay = min(delay * 2, 300)
+                continue
+            tail = collections.deque(maxlen=15)
             for line in self.proc.stdout:
-                m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
-                if m and not token:
+                tail.append(line.rstrip())
+                # The public link is the random <name>.trycloudflare.com host. Never take the API host
+                # (api.trycloudflare.com, which appears in error lines) or a line that reports a failure.
+                m = re.search(r"https://(?!api\.)[a-z0-9-]+\.trycloudflare\.com", line)
+                if m and not token and "failed" not in line:
                     self.url = m.group(0)
-                    if self.url != announced:          # only once per link (no repeat pushes)
-                        announced = self.url
-                        self._announce()
+                    self._announce()
                     found.set()
                 elif "Registered tunnel connection" in line and token:
-                    if announced is None:
-                        announced = "token"
-                        self._announce()
+                    self._announce()
                     found.set()
                 elif " ERR " in line or "Retrying connection" in line:
                     log.warning("Tunnel: %s", line.strip()[:200])
-            log.warning("cloudflared exited; restarting tunnel in 10 s")
-            time.sleep(10)
-            self._cloudflare()
-        threading.Thread(target=watch, daemon=True).start()
-        found.wait(30)
+            code = self.proc.wait()
+            log.warning("cloudflared exited (code %s). Its last output:", code)
+            for l in tail:
+                if l.strip():
+                    log.warning("  cloudflared: %s", l[:200])
+            if time.time() - started > 300:
+                delay = 10                      # it ran for a while: this is a new failure
+            log.warning("restarting the tunnel in %d s", delay)
+            time.sleep(delay)
+            delay = min(delay * 2, 300)
 
     def _tailscale(self):
         exe = self._exe("tailscale")
@@ -1853,6 +1878,10 @@ class Tunnel:
         self._announce()
 
     def _announce(self):
+        key_now = self.url or "connected"
+        if key_now == self._last_announced:
+            return                  # same link again (the tunnel restarted): don't send it twice
+        self._last_announced = key_now
         if not self.url:
             log.info("Tunnel connected (see your Cloudflare dashboard for the hostname)")
             return
@@ -1869,6 +1898,9 @@ class Tunnel:
         self._push(f"{self.url}/{key}", f"Player: {self.url}/{key}\nStream: {self.url}/stream{key}", app_link)
         if not self.password:
             log.warning("Your station is PUBLIC with no password. Set [stream] password in radio.toml.")
+        elif self.password.lower() in ("changeme", "password", "1234", "admin"):
+            log.warning("The [stream] password is a common default. Change it in radio.toml; "
+                        "the link above (and the phone notification) carries it.")
 
     def _push(self, click, body, app_link=None):
         """Send the links to your phone with ntfy (free app: ntfy.sh)."""

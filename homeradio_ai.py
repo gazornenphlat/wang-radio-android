@@ -399,6 +399,12 @@ class Voices:
         self._openai_speech(text, v, out, self.cfg.get("kokoro", {
             "url": "http://localhost:8880", "model": "kokoro", "voice": "af_bella"}))
 
+    def _voicestudio(self, text, v, out):
+        """VoiceStudio's OpenAI-style speech endpoint. voice = a VoiceStudio voice profile
+        (id or name, from GET /v1/audio/voices); model = an engine id, or tts-1 for the active engine."""
+        self._openai_speech(text, v, out, self.cfg.get("voicestudio", {
+            "url": "http://localhost:3900", "model": "omnivoice-subprocess", "timeout": 300}))
+
     def _chatterbox(self, text, v, out):
         self._openai_speech(text, v, out, self.cfg.get("chatterbox", {
             "url": "http://localhost:4123", "model": "chatterbox"}))
@@ -1221,12 +1227,14 @@ class Station:
         for v in list(self.voices.cfg.get("female", [])) + list(self.voices.cfg.get("male", [])):
             if isinstance(v, dict):
                 used.add(v.get("engine"))
-        for engine, path in (("kokoro", "/v1/audio/voices"), ("chatterbox", "/voices")):
+        for engine, path in (("kokoro", "/v1/audio/voices"), ("chatterbox", "/voices"),
+                             ("voicestudio", "/v1/audio/voices")):
             if engine not in used:
                 rows.append({"name": f"Voice: {engine}", "up": None, "detail": "not in use"})
                 continue
             urls = host_list(self.voices.cfg.get(engine, {}).get("url"),
-                             {"kokoro": "http://localhost:8880", "chatterbox": "http://localhost:4123"}[engine])
+                             {"kokoro": "http://localhost:8880", "chatterbox": "http://localhost:4123",
+                              "voicestudio": "http://localhost:3900"}[engine])
             ups = [probe(u, path) for u in urls]
             up = any(x[0] for x in ups)
             detail = "; ".join(f"{u} {'answers' if x[0] else 'not answering'}" for u, x in zip(urls, ups))
