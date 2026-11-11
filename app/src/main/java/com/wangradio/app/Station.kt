@@ -71,6 +71,7 @@ data class NowPlaying(
     val next: TrackRef?,
     val duration: Int = 0,    // song length in seconds (0 during breaks)
     val elapsed: Int = 0,     // seconds played so far when the station answered
+    val allowSkip: Boolean = true,  // false: this channel doesn't allow listener skips (server refuses too)
 )
 
 /** One line of radio.toml, as the station's /settings.json describes it. */
@@ -153,6 +154,7 @@ class StationApi(private val ctx: Context) {
                 next = ref(j.optJSONObject("next")),
                 duration = t.optInt("duration", 0),
                 elapsed = t.optInt("elapsed", 0),
+                allowSkip = j.optBoolean("allow_skip", true),
             )
         }.getOrNull()
     }

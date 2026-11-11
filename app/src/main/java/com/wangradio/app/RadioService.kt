@@ -354,6 +354,7 @@ class RadioService : MediaLibraryService() {
     }
 
     private fun skip(direction: String) {
+        if (now?.allowSkip == false) { toast(getString(R.string.skip_not_allowed)); return }
         scope.launch {
             if (!api.skip(direction)) {
                 toast(getString(R.string.skip_failed))
@@ -386,14 +387,16 @@ class RadioService : MediaLibraryService() {
                     .build()
             )
         }
-        list.add(
-            CommandButton.Builder().setDisplayName(getString(R.string.previous_song))
-                .setIconResId(R.drawable.ic_skip_previous).setSessionCommand(BACK).build()
-        )
-        list.add(
-            CommandButton.Builder().setDisplayName(getString(R.string.next_song))
-                .setIconResId(R.drawable.ic_skip_next).setSessionCommand(NEXT).build()
-        )
+        if (now?.allowSkip != false) {                  // channels with allow_skip = false get no back/next
+            list.add(
+                CommandButton.Builder().setDisplayName(getString(R.string.previous_song))
+                    .setIconResId(R.drawable.ic_skip_previous).setSessionCommand(BACK).build()
+            )
+            list.add(
+                CommandButton.Builder().setDisplayName(getString(R.string.next_song))
+                    .setIconResId(R.drawable.ic_skip_next).setSessionCommand(NEXT).build()
+            )
+        }
         return list.build()
     }
 
@@ -446,12 +449,13 @@ class RadioService : MediaLibraryService() {
             val changed = np.id != now?.id || np.title != now?.title ||
                 (np.id == null && np.artUrl != now?.artUrl)
             val ratingChanged = np.stars != now?.stars
+            val skipChanged = np.allowSkip != now?.allowSkip
             now = np
             if (changed && player.mediaItemCount > 0) {
                 // Same stream URL, new metadata: ExoPlayer updates it without interrupting audio.
                 stationPlayer.publish(liveItem(np).mediaMetadata)
             }
-            if (changed || ratingChanged) {
+            if (changed || ratingChanged || skipChanged) {
                 session.setCustomLayout(starButtons(np.stars))
             }
         }
