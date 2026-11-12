@@ -14,7 +14,7 @@ WANG Radio Android app.
 - `assets/` - next.mp3, back.mp3, record_scratch.mp3.
 - `effects/` - optional sound effects the DJ can drop into breaks. `effects_cache/` holds level-matched copies.
 - `test_station.py` - test harness (see Testing).
-- `android/` - WANG Radio Android app (Kotlin, Media3, Android Auto). See `ANDROID_SPEC.md`.
+- `app/` (+ root `build.gradle.kts`, `settings.gradle.kts`, `gradlew`) - WANG Radio Android app (Kotlin, Media3, Android Auto). See `ANDROID_SPEC.md`.
 
 ## Hard rules
 - **Python standard library only** in radio.py, homeradio_ai.py and homeradio_chat.py, plus
@@ -79,7 +79,7 @@ WANG Radio Android app.
 - Settings access: home network only, never through the tunnel, unless `[stream] admin_password` is
   set (sent as `X-Admin-Password`). Secrets are never sent to clients.
 
-## Android app (android/)
+## Android app (app/)
 - Screens: `ChannelsActivity`, `MainActivity` (player and chat card), `SettingsActivity`,
   `RadioService` (Media3 + Android Auto).
 - Built by GitHub Actions (`.github/workflows/build-apk.yml`), never locally. Keep `@color/wang_red`
