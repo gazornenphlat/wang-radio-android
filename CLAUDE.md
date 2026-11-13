@@ -92,8 +92,10 @@ WANG Radio Android app.
 ## Testing
 - Quick check: `python -m py_compile radio.py homeradio_ai.py homeradio_chat.py`.
 - Harness: `python test_station.py` (fake Ollama and Plex servers, temp station). Covers splicing,
-  effect leveling, Plex-star and genre filters (unit, with a stub), health, a stream listener and log
-  checks. It does NOT cover crossfades, batched breaks, two-computer failover, sidechain ducking, the
-  restart button, `allow_skip`, or a DJ break end to end. See `TEST_STATUS.md`. The owner reports the
-  restart button and `allow_skip` working on the real station (2026-11-02); that is not a harness result.
+  effect leveling, Plex-star and genre filters (unit, with a stub), the Plex watchdog (unit, service
+  call stubbed), health, a stream listener, `allow_skip` server refusal, `/restart` refusal without the
+  admin password, and log checks. Crossfades and batched breaks are only run for errors, not checked
+  for content. It does NOT cover a successful `/restart`, two-computer failover, sidechain ducking, or
+  a DJ break end to end. See `TEST_STATUS.md`. The owner reports the restart button and `allow_skip`
+  working on the real station (2026-11-02); that is not a harness result.
 - Behaviour changes should be checked against short test MP3s, not the real library.
