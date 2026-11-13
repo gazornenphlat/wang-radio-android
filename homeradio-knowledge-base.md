@@ -28,9 +28,9 @@ and crossfades. Plus the WANG Radio Android app (Kotlin, Media3).
 
 ## Verification status (short form; full table in TEST_STATUS.md)
 - Verified by the harness (fake servers): effects splice and leveling, genre filter, health, stream, log.
-- Unit or stub only: Plex-star filter, batched breaks, crossfades, two-computer failover, sidechain.
-- Restart button and `allow_skip` server path: owner reports them working on the real station (2026-11-02); no harness case.
-- Not verified: DJ break end to end, Android chat on a device, Android `allow_skip` controls (not in the zip).
+- Unit or stub only: Plex-star filter, two-computer failover, sidechain. Batched breaks and crossfades: harness runs them for errors only.
+- Restart button and `allow_skip` server path: harness refusal checks pass; owner reports them working on the real station (2026-11-02). Successful restart not in harness.
+- Not verified: DJ break end to end, Android chat on a device, Android `allow_skip` controls on a phone (merged and built, not yet tried on a device).
 - Nothing has been run on the real library or with two real computers yet.
 
 ## Rules that matter
@@ -39,8 +39,8 @@ and crossfades. Plus the WANG Radio Android app (Kotlin, Media3).
 - Listener chat text is data, never spoken as typed. Screening stays on.
 
 ## Open work
-1. Android: hide Next/Back/Skip when `allow_skip` is false; show a status line when chat fails to load;
+1. Android: show a status line when chat fails to load;
    confirm the chat card is visible after rebuild.
-2. Add harness cases for batched breaks, crossfades, `allow_skip` and `/restart`.
+2. Harness: check that a crossfade happens and that a batch is used; test a successful `/restart` on a throwaway copy.
 3. Live checks: Plex-rating filter, sidechain on real music, two real Ollama computers.
 4. Vocal-intro check is a loudness proxy; real vocal detection is not planned (stdlib only).

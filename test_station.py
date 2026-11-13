@@ -167,6 +167,53 @@ def unit_checks(station_module):
     g = m.Station._build_filter({"filter_genre": "rock"}, hub)
     check("filter: genre match is case-insensitive",
           g("/x/a.mp3", {"genre": "Classic ROCK"}) and not g("/x/b.mp3", {"genre": "Jazz"}))
+    plex_watch_checks(m)
+
+
+def plex_watch_checks(m):
+    """PlexWatch: restart after 3 failures in a row, never for a bad token, cooldown, reconnect."""
+    real_time, real_state, real_restart = m.time, m.plex_state, m.PlexWatch._restart_service
+    script, restarts, reconnects = [], [], []
+    m.plex_state = lambda url, token, timeout=10: script.pop(0) if script else "down"
+    m.PlexWatch._restart_service = lambda self: restarts.append(1)
+    m.time = types.SimpleNamespace(sleep=lambda s: None, time=time.time)   # no 60 s waits
+    hub = types.SimpleNamespace(plex=types.SimpleNamespace(
+        url="http://plex.test", token="t", reconnect=lambda: reconnects.append(1)), ai=None)
+    try:
+        pw = m.PlexWatch({}, hub)
+        script[:] = ["down", "down"]
+        pw.check(); pw.check()
+        check("plex watch: two failures in a row do not restart", not restarts)
+        script[:] = ["down", "ok"]                # 3rd failure -> restart -> Plex answers again
+        pw.check()
+        check("plex watch: third failure restarts the Plex service once",
+              len(restarts) == 1, f"restarts={len(restarts)}")
+        check("plex watch: station reconnects to Plex after a successful restart",
+              reconnects == [1] and pw.state == "ok")
+
+        restarts.clear()
+        pw2 = m.PlexWatch({}, hub)
+        script[:] = ["bad token"] * 5
+        for _ in range(5):
+            pw2.check()
+        check("plex watch: a rejected token never restarts Plex", not restarts)
+
+        restarts.clear()
+        pw3 = m.PlexWatch({}, hub)
+        script[:] = ["down", "down", "ok", "down", "down"]
+        for _ in range(5):
+            pw3.check()
+        check("plex watch: a good answer resets the failure count", not restarts)
+
+        restarts.clear()
+        pw4 = m.PlexWatch({"restart_cooldown_minutes": 30}, hub)
+        pw4._last_restart = time.time()                            # restarted a moment ago
+        script[:] = ["down"] * 4
+        for _ in range(4):
+            pw4.check()
+        check("plex watch: restarts are spaced by the cooldown", not restarts)
+    finally:
+        m.time, m.plex_state, m.PlexWatch._restart_service = real_time, real_state, real_restart
 
 
 # ------------------------------------------------------------------ integration
@@ -208,9 +255,19 @@ station_ids = "{ids}"
 id_interval_minutes = 1
 persona = "default"
 effects = "{effects}"
+[[channels]]
+id = "radio"
+name = "Test Radio Only"
+music = ["{os.path.join(work, 'music')}"]
+station_ids = "{ids}"
+id_interval_minutes = 1
+persona = "default"
+effects = "{effects}"
+allow_skip = false
 [stream]
 host = "127.0.0.1"
 port = {port}
+admin_password = "harness-pass"
 bitrate = "128k"
 play_only_when_listening = true
 stop_after_seconds = 15
@@ -228,6 +285,9 @@ research = false
 show_notes = false
 social_feed = false
 effects_per_hour = 30
+break_batch = 2
+[audio]
+crossfade_seconds = 1
 voiceover_chance = 0.5
 [ai.models]
 talk = "ollama:fake"
@@ -290,12 +350,38 @@ token = "test"
         with urllib.request.urlopen(base + "/c/main/status.json", timeout=5) as r:
             check("status: status.json answers", r.status == 200)
 
+        def post(path, headers=None):
+            req = urllib.request.Request(base + path, method="POST", data=b"", headers=headers or {})
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    return r.status
+            except urllib.error.HTTPError as e:
+                return e.code
+            except Exception as e:
+                return repr(e)
+
+        with urllib.request.urlopen(base + "/c/radio/status.json", timeout=5) as r:
+            check("allow_skip: status reports allow_skip false", json.loads(r.read()).get("allow_skip") is False)
+        check("allow_skip: next is refused on a channel with allow_skip = false",
+              post("/c/radio/skip?dir=next") == 403)
+        check("allow_skip: back is refused on that channel", post("/c/radio/skip?dir=back") == 403)
+        check("allow_skip: next still works on a normal channel",
+              post("/c/main/skip?dir=next") in (200, 409))
+        check("restart: refused without the admin password", post("/restart") == 403)
+        check("restart: refused with a wrong admin password",
+              post("/restart", {"X-Admin-Password": "nope"}) == 403)
+        check("restart: station still running after the refused restarts", proc.poll() is None)
+
         time.sleep(4)
         log_path = os.path.join(work, "radio.log")
         text = open(log_path, encoding="utf-8", errors="replace").read() if os.path.exists(log_path) else ""
         check("log: no tracebacks", "Traceback" not in text)
         check("log: no playout errors", "Playout error" not in text)
         check("log: a song was played", "PLAY:" in text)
+        check("crossfade: station ran with crossfade_seconds = 1 without playout errors",
+              "Playout error" not in text and "Traceback" not in text)
+        check("batched breaks: station ran with break_batch = 2 without tracebacks",
+              "Traceback" not in text)
     except Exception as e:
         check("integration run", False, repr(e))
     finally:
