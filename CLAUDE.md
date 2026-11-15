@@ -84,6 +84,12 @@ WANG Radio Android app.
   `RadioService` (Media3 + Android Auto).
 - Built by GitHub Actions (`.github/workflows/build-apk.yml`), never locally. Keep `@color/wang_red`
   (the icon background uses it).
+- Release signing: the release build is signed with the debug key on purpose
+  (`app/build.gradle.kts`), so the APK installs without extra setup. That means anyone with
+  an Android SDK can build a modified "WANG Radio" that Android treats as the same app, and a
+  differently signed update later would refuse to install over it. Moving to a real keystore
+  (kept out of git — `*.keystore` is already excluded — passed to Actions as secrets, one
+  reinstall) is a deliberate owner decision, not yet done.
 - Server API: `/channels.json`, `/c/<id>/status.json`, `/c/<id>/stream?noicy=1`, `/c/<id>/rate`,
   `/c/<id>/skip?dir=next|back`, `/c/<id>/chat.json`, `/c/<id>/chat`, `/settings.json`. Every request
   carries `?key=`.

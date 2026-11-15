@@ -958,21 +958,33 @@ class TomlFile:
         return None
 
 
-def settings_allowed(handler, admin_password):
-    """With [stream] admin_password: anyone who knows it. Without one: only from your own
-    network, never through the internet tunnel."""
+def settings_denied_reason(handler, admin_password):
+    """None when settings are allowed, else a short reason naming what blocked it
+    (the proxy header, the wrong admin password, or a non-local source address)."""
     if admin_password:
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(handler.path).query)
-        return (handler.headers.get("X-Admin-Password") or qs.get("admin", [""])[0]) == admin_password
-    if any(handler.headers.get(h) for h in ("Cf-Connecting-Ip", "X-Forwarded-For", "Tailscale-User-Login",
-                                             "Tailscale-Funnel-Request", "X-Real-Ip")):
-        return False
+        if (handler.headers.get("X-Admin-Password") or qs.get("admin", [""])[0]) == admin_password:
+            return None
+        return "admin password missing or wrong"
+    for h in ("Cf-Connecting-Ip", "X-Forwarded-For", "Tailscale-User-Login",
+              "Tailscale-Funnel-Request", "X-Real-Ip"):
+        if handler.headers.get(h):
+            return f"came through a proxy ({h} header present)"
     ip = handler.client_address[0]
     try:
         import ipaddress
-        return ipaddress.ip_address(ip).is_private or ipaddress.ip_address(ip).is_loopback
+        addr = ipaddress.ip_address(ip)
     except ValueError:
-        return False
+        return f"source address {ip!r} is not a valid IP"
+    if addr.is_private or addr.is_loopback:
+        return None
+    return f"source {ip} is not on the home network (not private or loopback)"
+
+
+def settings_allowed(handler, admin_password):
+    """With [stream] admin_password: anyone who knows it. Without one: only from your own
+    network, never through the internet tunnel."""
+    return settings_denied_reason(handler, admin_password) is None
 
 
 def make_handler(hub):
@@ -1020,7 +1032,9 @@ def make_handler(hub):
                 page = SETTINGS.replace("%TITLE%", html.escape(hub.title)).replace("%KEY%", key)
                 return self.send(200, "text/html; charset=utf-8", page.replace("%STYLE%", STYLE_HEAD).encode())
             if u.path == "/settings.json":
-                if not settings_allowed(self, admin_password):
+                reason = settings_denied_reason(self, admin_password)
+                if reason:
+                    log.warning("Settings denied for %s: %s", self.client_ip(), reason)
                     return self.send(403, "application/json", json.dumps(
                         {"error": "admin" if admin_password else "local"}).encode())
                 try:
@@ -1121,7 +1135,9 @@ def make_handler(hub):
             if not self._authed(qs):
                 return self.send_error(403, "Wrong or missing ?key=")
             if u.path == "/settings.json":
-                if not settings_allowed(self, admin_password):
+                reason = settings_denied_reason(self, admin_password)
+                if reason:
+                    log.warning("Settings denied for %s: %s", self.client_ip(), reason)
                     return self.send(403, "application/json", json.dumps({"error": "denied"}).encode())
                 try:
                     n = int(self.headers.get("Content-Length", 0) or 0)
@@ -1135,7 +1151,9 @@ def make_handler(hub):
                 return self.send(400 if err else 200, "application/json",
                                  json.dumps({"ok": not err, "error": err}).encode())
             if u.path == "/restart":
-                if not settings_allowed(self, admin_password):
+                reason = settings_denied_reason(self, admin_password)
+                if reason:
+                    log.warning("Settings denied for %s: %s", self.client_ip(), reason)
                     return self.send(403, "application/json", json.dumps(
                         {"ok": False, "error": "Only the station owner can restart"}).encode())
                 self.send(200, "application/json", json.dumps({"ok": True}).encode())
@@ -1158,7 +1176,9 @@ def make_handler(hub):
                 except ValueError:
                     req = {}
                 if path == "/chat/approve":
-                    if not settings_allowed(self, admin_password):
+                    reason = settings_denied_reason(self, admin_password)
+                    if reason:
+                        log.warning("Settings denied for %s: %s", self.client_ip(), reason)
                         return self.send(403, "application/json", json.dumps(
                             {"ok": False, "error": "Only the station owner can do that"}).encode())
                     ok = chat.approve(ctx.id, req.get("id"), bool(req.get("ok", True)))
