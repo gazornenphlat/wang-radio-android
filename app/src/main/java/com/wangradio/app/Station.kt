@@ -210,23 +210,6 @@ class StationApi(private val ctx: Context) {
         }
     }
 
-    /** Sends a thumbs up/down. Returns the rating now saved on the server ("up", "down" or null if cleared). */
-    suspend fun rate(id: String?, rating: String): Result<String?> = withContext(Dispatchers.IO) {
-        runCatching {
-            val c = URL(withKey("/rate")).openConnection() as HttpURLConnection
-            c.requestMethod = "POST"
-            c.connectTimeout = 8000; c.readTimeout = 8000
-            c.doOutput = true
-            c.setRequestProperty("Content-Type", "application/json")
-            val body = JSONObject().put("rating", rating).apply { if (id != null) put("id", id) }
-            c.outputStream.use { it.write(body.toString().toByteArray()) }
-            if (c.responseCode == 409) error("Nothing to rate during a station break")
-            if (c.responseCode !in 200..299) error("Server said ${c.responseCode}")
-            val r = JSONObject(c.inputStream.bufferedReader().readText()).optString("rating")
-            r.takeIf { it == "up" || it == "down" }
-        }
-    }
-
     /** Every setting in the station's radio.toml. */
     suspend fun settings(): SettingsResult = withContext(Dispatchers.IO) {
         if (base.isEmpty()) return@withContext SettingsResult.Offline

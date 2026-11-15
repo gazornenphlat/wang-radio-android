@@ -321,7 +321,7 @@
                 android:paddingBottom="7dp"
                 app:layout_constraintEnd_toEndOf="parent"
                 app:layout_constraintStart_toStartOf="parent"
-                app:layout_constraintTop_toBottomOf="@id/stars_row">
+                app:layout_constraintTop_toBottomOf="@id/chat_box">
 
                 <LinearLayout
                     android:layout_width="match_parent"
@@ -357,7 +357,7 @@
                 android:visibility="gone"
                 app:layout_constraintEnd_toEndOf="parent"
                 app:layout_constraintStart_toStartOf="parent"
-                app:layout_constraintTop_toBottomOf="@id/queue">
+                app:layout_constraintTop_toBottomOf="@id/stars_row">
 
                 <LinearLayout
                     android:layout_width="match_parent"
