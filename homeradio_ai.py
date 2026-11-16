@@ -103,6 +103,26 @@ def tail_key(p):
     return "/".join(norm_path(p).split("/")[-2:])
 
 
+def loose_json(text):
+    """The first JSON object in a model's reply. Ignores hidden reasoning, code fences and
+    prose around it, and mends trailing commas. Raises ValueError if there is none."""
+    t = re.sub(r"<think>.*?</think>", " ", text or "", flags=re.S | re.I)
+    dec = json.JSONDecoder()
+    candidates = (t, re.sub(r",\s*([}\]])", r"\1", t))
+    for first_only in (True, False):               # the outermost object first, then any inner one
+        for candidate in candidates:
+            for m in re.finditer(r"\{", candidate):
+                try:
+                    obj, _ = dec.raw_decode(candidate, m.start())
+                except ValueError:
+                    if first_only:
+                        break
+                    continue
+                if isinstance(obj, dict):
+                    return obj
+    raise ValueError("the model's reply was not valid JSON")
+
+
 # --------------------------------------------------------------------------
 # 1. Model client: Ollama first, hosted APIs optional
 # --------------------------------------------------------------------------
@@ -281,9 +301,16 @@ class Models:
         raise RuntimeError(f"provider '{prov_name}' ({kind}) has no embeddings")
 
     def ask_json(self, job, system, user, temperature=0.7):
+        """The model's reply as a dict. Local models without a JSON mode (LM Studio) sometimes
+        write broken JSON, so the reply is read leniently and asked for once more if needed."""
         text = self.ask(job, system, user, want_json=True, temperature=temperature)
-        m = re.search(r"\{.*\}", text, re.S)  # tolerate stray prose around JSON
-        return json.loads(m.group(0) if m else text)
+        try:
+            return loose_json(text)
+        except ValueError:
+            text = self.ask(job, system + " Reply with one valid JSON object only: double-quoted "
+                            "keys and strings, no quote marks inside a string, nothing before or "
+                            "after it.", user, want_json=True, temperature=0.1)
+            return loose_json(text)
 
 
 # --------------------------------------------------------------------------
