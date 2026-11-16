@@ -386,8 +386,17 @@ class Library:
         self.files = []
         self.recent = collections.deque(maxlen=1)
         self.durations = {}
+        # Genre/artist filters need every file's tags. Reading them takes a while for a big
+        # library, so it happens in the background and is remembered between runs; picking a
+        # song only ever looks at tags that are already known.
+        self.needs_tags = bool(track_filter and getattr(track_filter, "needs_tags", True))
+        self.tags = {}                                 # path -> [mtime, genre, artist]
+        self.tags_path = (os.path.splitext(cache_path)[0] + "_tags.json") if cache_path else None
         self._load_cache()
         threading.Thread(target=self._scanner, daemon=True, name="library-scan").start()
+        if self.needs_tags:
+            self._load_tags()
+            threading.Thread(target=self._tagger, daemon=True, name="library-tags").start()
 
     # -- cache
     def _load_cache(self):
@@ -413,6 +422,68 @@ class Library:
             os.replace(tmp, self.cache_path)
         except OSError as e:
             log.warning("Couldn't save library cache: %s", e)
+
+    # -- tags for genre/artist filters
+    def _load_tags(self):
+        try:
+            with open(self.tags_path, encoding="utf-8") as f:
+                self.tags = json.load(f)
+            log.info("Library: tags known for %d songs (from last run)", len(self.tags))
+        except (OSError, ValueError, TypeError):
+            self.tags = {}
+
+    def _save_tags(self):
+        if not self.tags_path:
+            return
+        try:
+            tmp = self.tags_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(dict(self.tags), f)
+            os.replace(tmp, self.tags_path)
+        except OSError as e:
+            log.warning("Couldn't save the tag cache: %s", e)
+
+    def _read_tags(self, path):
+        try:
+            mtime = int(os.path.getmtime(path))
+        except OSError:
+            return
+        old = self.tags.get(path)
+        if old and old[0] == mtime:
+            return
+        _, _, info = probe(path)
+        self.tags[path] = [mtime, info.get("genre", ""), info.get("artist", "")]
+        self._tags_new += 1
+
+    _tags_new = 0
+
+    def _tagger(self):
+        """Read the tags of songs not seen before (or changed since). Never raises."""
+        from concurrent.futures import ThreadPoolExecutor
+        self.ready.wait()
+        while True:
+            try:
+                with self.lock:
+                    files = list(self.files)
+                todo = [f for f in files if f not in self.tags]
+                if todo:
+                    log.info("Library: reading tags of %d songs for the channel filter (%s)",
+                             len(todo), self.folder)
+                self._tags_new, saved_at, t0 = 0, time.time(), time.time()
+                with ThreadPoolExecutor(max_workers=3) as pool:
+                    for i, _ in enumerate(pool.map(self._read_tags, files), 1):
+                        if self._tags_new and time.time() - saved_at > 60:
+                            self._save_tags()
+                            saved_at = time.time()
+                if self._tags_new:
+                    self._save_tags()
+                    log.info("Library: tags read for %d songs in %.0f s", self._tags_new, time.time() - t0)
+            except Exception as e:
+                log.warning("Library tag reading problem: %s", e)
+            waited = 0                                 # again after a rescan, or sooner if songs were added
+            while waited < self.rescan_every and len(self.files) == len(files):
+                time.sleep(20)
+                waited += 20
 
     # -- background scanning
     def _scanner(self):
@@ -484,8 +555,12 @@ class Library:
     def _passes_filter(self, path):
         """Check a track against the channel's genre/artist/star filter."""
         try:
-            _, _, info = self.duration(path)
-            return self.track_filter(path, info)
+            if not self.needs_tags:                    # star filters don't need the file's tags
+                return self.track_filter(path, {"id": track_id(path)})
+            t = self.tags.get(path)
+            if not t:
+                return False                           # tags not read yet; it joins in once they are
+            return self.track_filter(path, {"id": track_id(path), "genre": t[1], "artist": t[2]})
         except Exception:
             return True
 
@@ -2076,6 +2151,7 @@ class Station:
                 if not s or s < min_stars:
                     return False
             return True
+        accept.needs_tags = bool(genre or artist)     # genre/artist come from the files' tags
         return accept
 
     def leveled_effect(self, path):

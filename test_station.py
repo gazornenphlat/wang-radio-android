@@ -26,6 +26,7 @@ import tempfile
 import threading
 import time
 import types
+import urllib.parse
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -168,6 +169,66 @@ def unit_checks(station_module):
     check("filter: genre match is case-insensitive",
           g("/x/a.mp3", {"genre": "Classic ROCK"}) and not g("/x/b.mp3", {"genre": "Jazz"}))
     plex_watch_checks(m)
+    library_filter_checks(m)
+
+
+def library_filter_checks(m):
+    """Genre channels read tags in the background; the Plex index is fetched in pages."""
+    tmp = tempfile.mkdtemp(prefix="hr_lib_")
+    try:
+        album = os.path.join(tmp, "Album")
+        os.makedirs(album)
+        tone(os.path.join(album, "blue.mp3"), 1, genre="Delta Blues")
+        tone(os.path.join(album, "rock.mp3"), 1, freq=600, genre="Rock")
+        f = m.Station._build_filter({"filter_genre": "blues"}, types.SimpleNamespace(ai=None, ratings=None))
+        lib = m.Library([tmp], cache_path=os.path.join(tmp, "library_cache_t.json"), track_filter=f)
+        end = time.time() + 30
+        while len(lib.tags) < 2 and time.time() < end:
+            time.sleep(0.2)
+        picks = [os.path.basename(p) for p in lib._candidates()]
+        check("library: genre channel plays only matching songs once tags are read",
+              picks == ["blue.mp3"], f"{picks}")
+        lib.durations = None                       # picking must not probe files itself
+        try:
+            ok = bool(lib._candidates())
+        except Exception:
+            ok = False
+        check("library: picking a song for a filtered channel never probes files", ok)
+        time.sleep(0.5)
+        check("library: tags are remembered between runs", os.path.isfile(lib.tags_path))
+        stars = m.Station._build_filter({"filter_stars": 5, "filter_stars_from": "plex"}, types.SimpleNamespace(
+            ai=types.SimpleNamespace(rotation=types.SimpleNamespace(plex=types.SimpleNamespace(
+                find=lambda p: {"stars": 5} if p.endswith("blue.mp3") else None))), ratings=None))
+        check("library: a star filter needs no file tags", stars.needs_tags is False)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    import homeradio_ai as ai
+    songs = [f"/music/Album/song{i}.mp3" for i in range(7)]
+    calls = []
+
+    def library(h):
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(h.path).query)
+        start, size = int(q["X-Plex-Container-Start"][0]), int(q["X-Plex-Container-Size"][0])
+        calls.append(start)
+        meta = [{"ratingKey": i, "grandparentTitle": "A", "userRating": 10,
+                 "Media": [{"Part": [{"file": p}]}]} for i, p in enumerate(songs)][start:start + size]
+        return {"MediaContainer": {"totalSize": len(songs), "Metadata": meta}}
+    srv = FakeServer({
+        "/library/sections": lambda h: {"MediaContainer": {"Directory": [{"key": "1", "type": "artist"}]}},
+        "/library/sections/1/all": library})
+    try:
+        px = ai.PlexSimilar({"url": f"http://127.0.0.1:{srv.port}", "token": "t"})
+        px.PAGE = 3
+        px.index()
+        check("plex index: a big library is fetched in pages",
+              len(px.tracks) == 7 and calls == [0, 3, 6], f"{len(px.tracks)} songs, calls {calls}")
+        check("plex index: 5-star lookup works after paging",
+              (px.find("T:\\Music\\Album\\song6.mp3") or {}).get("stars") == 5)
+    except Exception as e:
+        check("plex index: a big library is fetched in pages", False, repr(e))
+    finally:
+        srv.shutdown()
 
 
 def plex_watch_checks(m):

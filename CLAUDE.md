@@ -65,6 +65,11 @@ WANG Radio Android app.
   `filter_stars`, `filter_stars_from` ("station" or "plex"), `allow_skip` (false = no Next/Back,
   enforced on the server too).
 - A filter that matches nothing plays the channel unfiltered and logs a warning.
+- Genre and artist filters need file tags. `Library` reads them in a background thread and keeps them in
+  `library_cache*_tags.json`; picking a song never probes files. Until the first match is known the
+  channel plays unfiltered. Star filters need no tags.
+- The Plex library index (`PlexSimilar.index`) is fetched 1000 songs per request; a failed index is
+  retried after 2 minutes.
 
 ## Web pages and settings
 - Pages are HTML strings in radio.py (`PAGE`, `PICKER`, `SETTINGS`, `HEALTH`, shared `STYLE_HEAD`, `ICONS`).

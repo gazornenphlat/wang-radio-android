@@ -668,23 +668,32 @@ class PlexSimilar:
 
     def _get(self, path, **params):
         params["X-Plex-Token"] = self.token
-        return http_json(f"{self.url}{path}?{urllib.parse.urlencode(params)}", timeout=60)
+        return http_json(f"{self.url}{path}?{urllib.parse.urlencode(params)}", timeout=120)
+
+    PAGE = 1000          # songs per request: one request for a big library times out
 
     def index(self):
         tracks = []
         for sec in self._get("/library/sections")["MediaContainer"].get("Directory", []):
             if sec.get("type") != "artist":
                 continue
-            mc = self._get(f"/library/sections/{sec['key']}/all", type=10)["MediaContainer"]
-            for t in mc.get("Metadata", []) or []:
-                for m in t.get("Media", []) or []:
-                    for p in m.get("Part", []) or []:
-                        if p.get("file"):
-                            # Plex keeps ratings out of 10 (two per star)
-                            stars = round(float(t.get("userRating") or 0) / 2)
-                            tracks.append({"key": str(t["ratingKey"]),
-                                           "artist": t.get("originalTitle") or t.get("grandparentTitle", ""),
-                                           "file": p["file"], "stars": stars})
+            start = 0
+            while True:
+                mc = self._get(f"/library/sections/{sec['key']}/all", type=10, **{
+                    "X-Plex-Container-Start": start, "X-Plex-Container-Size": self.PAGE})["MediaContainer"]
+                page = mc.get("Metadata", []) or []
+                for t in page:
+                    for m in t.get("Media", []) or []:
+                        for p in m.get("Part", []) or []:
+                            if p.get("file"):
+                                # Plex keeps ratings out of 10 (two per star)
+                                stars = round(float(t.get("userRating") or 0) / 2)
+                                tracks.append({"key": str(t["ratingKey"]),
+                                               "artist": t.get("originalTitle") or t.get("grandparentTitle", ""),
+                                               "file": p["file"], "stars": stars})
+                start += len(page)
+                if len(page) < self.PAGE or start >= int(mc.get("totalSize") or start + 1):
+                    break
         self.tracks = tracks
         self.by_tail = {tail_key(t["file"]): t for t in tracks}
         self.indexed_at = time.time()
@@ -741,8 +750,8 @@ class Rotation:
                 if time.time() - self.plex.indexed_at > 6 * 3600:
                     self.plex.index()
             except Exception as e:
-                log(f"Plex: library index update failed ({e}); trying again later")
-                time.sleep(600)
+                log(f"Plex: library index update failed ({e}); trying again in 2 minutes")
+                time.sleep(90)
             time.sleep(30)
 
 
