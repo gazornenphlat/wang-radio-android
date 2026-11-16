@@ -504,14 +504,11 @@ class Research:
         if not sents:
             return []
         numbered = "\n".join(f"{i}: {s}" for i, s in enumerate(sents))
-        out = self.models.ask_json(
-            "facts",
-            "You pull short, interesting radio facts out of reference text. "
-            "Use ONLY the numbered sentences. Return JSON: "
-            '{"facts":[{"fact":"...","sentence":N}]} with 2 to ' + str(how_many) + " items. "
-            "Each fact must be fully supported by sentence N, one sentence long, "
-            "no opinions, no outside knowledge.",
-            f"Subject: {label}\nSentences:\n{numbered}", temperature=0.2)
+        try:
+            out = self._facts_json(label, numbered, how_many)
+        except ValueError as e:                    # unreadable reply: lose this page, keep the rest
+            log(f"research: {label}: no facts from this page ({e})")
+            return []
         claims = []
         for f in (out.get("facts") or [])[:how_many]:
             try:
@@ -521,6 +518,16 @@ class Research:
             if 0 <= n < len(sents) and 10 < len(fact) < 220 and self.supported(fact, sents[n]):
                 claims.append({"fact": fact, "source": sents[n], "url": url, "kind": kind})
         return claims
+
+    def _facts_json(self, label, numbered, how_many):
+        return self.models.ask_json(
+            "facts",
+            "You pull short, interesting radio facts out of reference text. "
+            "Use ONLY the numbered sentences. Return JSON: "
+            '{"facts":[{"fact":"...","sentence":N}]} with 2 to ' + str(how_many) + " items. "
+            "Each fact must be fully supported by sentence N, one sentence long, "
+            "no opinions, no outside knowledge.",
+            f"Subject: {label}\nSentences:\n{numbered}", temperature=0.2)
 
     @staticmethod
     def mb_claims(mb):

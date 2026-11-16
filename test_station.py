@@ -204,6 +204,17 @@ def library_filter_checks(m):
         shutil.rmtree(tmp, ignore_errors=True)
 
     import homeradio_ai as ai
+    check("json: reply with reasoning, a code fence and a trailing comma is still read",
+          ai.loose_json('<think>{maybe}</think>Here:\n```json\n{"facts": [{"fact": "A", "sentence": 1},]}\n```')
+          == {"facts": [{"fact": "A", "sentence": 1}]})
+    replies = ['{"facts":[{"fact":"He wrote "Goldfinger".","sentence":1}]}', '{"facts":[]}']
+    asked = []
+
+    def fake_ask(job, system, user, want_json=False, temperature=0.7):
+        asked.append(system)
+        return replies[len(asked) - 1]
+    got = ai.Models.ask_json(types.SimpleNamespace(ask=fake_ask), "facts", "sys", "user")
+    check("json: a broken reply is asked for once more", got == {"facts": []} and len(asked) == 2)
     songs = [f"/music/Album/song{i}.mp3" for i in range(7)]
     calls = []
 
